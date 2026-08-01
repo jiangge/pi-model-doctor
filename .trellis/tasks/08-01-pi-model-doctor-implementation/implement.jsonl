@@ -1,0 +1,7 @@
+{"file":".trellis/spec/backend/index.md","reason":"Backend spec entry point and quality checklist for the TypeScript extension's domain, persistence, and command adapter."}
+{"file":".trellis/spec/backend/directory-structure.md","reason":"Defines the module organization and naming conventions used for the extension package."}
+{"file":".trellis/spec/backend/error-handling.md","reason":"Guides safe error propagation for filesystem, network, JSON, and command failures."}
+{"file":".trellis/spec/backend/logging-guidelines.md","reason":"Requires secret-safe diagnostics and prevents API keys from entering output."}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"Defines testing, type-safety, and forbidden-pattern expectations for implementation."}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Required shared guide for new utility/helper modules and repeated ownership/capability logic."}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Required shared guide because command, domain, persistence, cache, and Pi integration layers interact."}

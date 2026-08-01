@@ -1,2 +1,4 @@
 .ml-cache/
 .mainline/local.toml
+.pi/extensions/model-doctor/node_modules/
+.pi/extensions/model-doctor/npm-debug.log*

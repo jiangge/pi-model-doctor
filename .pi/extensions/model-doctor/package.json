@@ -1,0 +1,29 @@
+{
+  "name": "pi-model-doctor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Safe lifecycle management for Pi models.json using models.dev metadata.",
+  "keywords": [
+    "pi-package"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "scripts": {
+    "test": "node --import tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.82.1",
+    "@types/node": "^22.20.1",
+    "tsx": "^4.23.1",
+    "typescript": "5.9"
+  }
+}

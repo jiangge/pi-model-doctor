@@ -1,0 +1,6 @@
+{"file":".trellis/spec/backend/index.md","reason":"Backend quality checklist for reviewing persistence, command, and domain changes."}
+{"file":".trellis/spec/backend/error-handling.md","reason":"Review error boundaries and user-facing command failures."}
+{"file":".trellis/spec/backend/logging-guidelines.md","reason":"Review diagnostics for secret leakage and useful structured output."}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"Review tests, strict typing, and forbidden patterns."}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Review utility reuse and duplicated constants."}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Review data flow from slash command through domain and file/cache persistence."}
