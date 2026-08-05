@@ -2,26 +2,24 @@
 
 ## Scope
 
-This repository is a Pi extension project. The production Model Doctor code lives in `.pi/extensions/model-doctor/` so Pi can discover it from project settings without coupling the extension to Pi internals.
+This repository is a publishable Pi package. The production Model Doctor code lives at the repository root so npm/Git/package consumers receive one self-contained package; `.pi/settings.json` only contains the local development smoke-test registration.
 
 ## Layout
 
 ```text
-.pi/
-├── settings.json                         # project resource registration
-└── extensions/model-doctor/
-    ├── index.ts                          # Pi ExtensionAPI entry point
-    ├── package.json                      # local test/package metadata
-    ├── tsconfig.json                     # strict TypeScript settings
-    ├── src/
-    │   ├── types.ts                      # JSON, models.dev, capability contracts
-    │   ├── json.ts                       # config parsing, ownership, atomic writes
-    │   ├── cache.ts                      # local cache persistence
-    │   ├── models-dev.ts                 # remote catalog client and matching
-    │   ├── capabilities.ts               # cache/reasoning engines and adapters
-    │   ├── doctor.ts                     # add/list/check/fix/remove domain service
-    │   └── command.ts                    # unified /model-doctor command adapter
-    └── test/model-doctor.test.ts         # public behavior tests
+index.ts                                   # Pi ExtensionAPI entry point
+package.json                               # publishable Pi package manifest
+tsconfig.json                              # strict TypeScript settings
+src/
+├── types.ts                               # JSON, models.dev, capability contracts
+├── json.ts                                # config parsing, ownership, atomic writes
+├── cache.ts                               # local cache persistence
+├── models-dev.ts                          # remote catalog client and matching
+├── capabilities.ts                        # cache/reasoning engines and adapters
+├── doctor.ts                              # add/list/check/fix/remove domain service
+└── command.ts                             # unified /model-doctor command adapter
+test/model-doctor.test.ts                  # public behavior tests
+.pi/settings.json                          # local checkout registration: ../index.ts
 ```
 
 Pure domain code belongs in `src/`; Pi UI/command registration belongs in `command.ts` and `index.ts`. Do not read Pi's private `dist/core` modules when a public ExtensionAPI or config API exists.
@@ -32,6 +30,7 @@ Use kebab-free lowercase filenames, PascalCase classes, and verb-oriented export
 
 ## Examples
 
-- `.pi/extensions/model-doctor/src/json.ts` is the persistence boundary.
-- `.pi/extensions/model-doctor/src/doctor.ts` is the orchestration/service boundary.
-- `.pi/extensions/model-doctor/src/command.ts` is the thin Pi command/UI boundary.
+- `src/json.ts` is the persistence boundary.
+- `src/doctor.ts` is the orchestration/service boundary.
+- `src/command.ts` is the thin Pi command/UI boundary.
+- `package.json` is the publishable package boundary; its `pi.extensions` manifest points to `./index.ts`.

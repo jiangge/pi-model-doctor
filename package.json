@@ -1,12 +1,24 @@
 {
   "name": "pi-model-doctor",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
   "description": "Safe lifecycle management for Pi models.json using models.dev metadata.",
   "keywords": [
-    "pi-package"
+    "pi-package",
+    "pi-extension",
+    "models.dev"
   ],
+  "files": [
+    "index.ts",
+    "src",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "typebox": "*"
@@ -19,6 +31,9 @@
     "extensions": [
       "./index.ts"
     ]
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.82.1",

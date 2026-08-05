@@ -20,11 +20,11 @@
 ## Test Commands
 
 ```bash
-npm run typecheck --prefix .pi/extensions/model-doctor
-npm test --prefix .pi/extensions/model-doctor
+npm run typecheck
+npm test
 ```
 
-Tests use Node's built-in test runner with `tsx`, temporary directories, and mocked `fetch`. Assertions target public domain behavior: command parsing, resolver output, ownership decisions, cache fallback, backups, dry-run behavior, and end-to-end mutations.
+Tests use Node's built-in test runner with `tsx`, temporary directories, and mocked `fetch`. Assertions target public domain behavior: command parsing, resolver output, ownership decisions, cache fallback, backups, dry-run behavior, package loading, and end-to-end mutations.
 
 ## Review Checklist
 

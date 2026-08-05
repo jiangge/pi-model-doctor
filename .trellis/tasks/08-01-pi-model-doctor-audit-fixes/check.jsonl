@@ -1,0 +1,4 @@
+{"file":".trellis/spec/backend/model-doctor-contract.md","reason":"Verify every acceptance item against the maintained Model Doctor contract."}
+{"file":".trellis/spec/backend/error-handling.md","reason":"Verify typed errors and safe failure behavior for no-UI, cache, migration, and write failures."}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"Verify final typecheck, tests, secret-safety, and production-source quality."}
+{"file":".trellis/workflow.md","reason":"Verify task completion, commit, and archive lifecycle."}

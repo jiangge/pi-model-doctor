@@ -2,7 +2,7 @@
   "enableSkillCommands": true,
   "extensions": [
     "./extensions/trellis/index.ts",
-    "./extensions/model-doctor/index.ts"
+    "../index.ts"
   ],
   "skills": [
     "./skills"

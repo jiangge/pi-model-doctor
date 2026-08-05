@@ -1,0 +1,4 @@
+{"file":".trellis/spec/backend/model-doctor-contract.md","reason":"Existing command, persistence, cache, capability, migration, and test contracts must be updated alongside implementation."}
+{"file":".trellis/spec/backend/error-handling.md","reason":"New no-UI authorization, migration conflicts, policy cache failures, and refresh warnings must follow backend error conventions."}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"Use the repository quality bar for type safety, test coverage, and side-effect boundaries."}
+{"file":".trellis/workflow.md","reason":"Task lifecycle and implementation verification requirements apply to this multi-file change."}
