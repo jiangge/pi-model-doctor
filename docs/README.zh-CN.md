@@ -1,12 +1,56 @@
 # Pi Model Doctor
 
-> [English](README.md) | **简体中文**
+> [English](../README.md) | **简体中文**
 
 Pi Model Doctor 是一个项目级 Pi 扩展，用于管理 `models.json` 中的模型生命周期。它从 [models.dev](https://models.dev) 发现 provider 元数据、补全模型能力、检查现有配置，并在不覆盖用户自有设置的前提下执行安全修复。
 
-## 加载方式
+## 目录
 
-本仓库的 `.pi/settings.json` 会自动加载根目录包入口：
+- [安装、更新与卸载](#安装更新与卸载)
+- [本地开发检出](#本地开发检出)
+- [命令](#命令)
+- [安全写入与所有权](#安全写入与所有权)
+- [缓存与离线行为](#缓存与离线行为)
+- [Provider 能力](#provider-能力)
+- [开发](#开发)
+
+## 安装、更新与卸载
+
+从 npm 安装到当前 Pi 用户环境：
+
+```bash
+pi install npm:pi-model-doctor
+```
+
+安装到当前项目的 `.pi/settings.json`：
+
+```bash
+pi install npm:pi-model-doctor -l
+```
+
+更新已安装的包：
+
+```bash
+pi update npm:pi-model-doctor
+```
+
+从安装时对应的作用域卸载：
+
+```bash
+# 全局/用户级安装
+pi remove npm:pi-model-doctor
+# 等价命令
+pi uninstall npm:pi-model-doctor
+
+# 项目级安装
+pi remove npm:pi-model-doctor -l
+```
+
+安装或卸载后，请重启 Pi 或开启新会话，使扩展注册信息重新加载。卸载扩展不会删除已经写入 `models.json` 的模型；如需删除配置条目，请使用 `/model-doctor remove <provider/model>`，并保留时间戳备份以便回滚。
+
+## 本地开发检出
+
+用于本仓库开发冒烟测试时，`.pi/settings.json` 中与 Model Doctor 相关的条目是：
 
 ```json
 {
@@ -14,16 +58,18 @@ Pi Model Doctor 是一个项目级 Pi 扩展，用于管理 `models.json` 中的
 }
 ```
 
-对于其他 Pi 项目，可通过 `pi install npm:pi-model-doctor` 安装已发布包，或将包目录加入该项目的 Pi settings。包清单通过 `pi.extensions` 字段暴露 `index.ts`。
+Pi 会以项目的 `.pi/` 目录作为 `.pi/settings.json` 相对路径的基准，因此 `../index.ts` 会正确指向仓库根目录的 `index.ts`。这只是开发注册相关的最小摘录；实际项目配置还可以包含其他 extensions、skills、prompts 和 packages。
+
+对于其他 Pi 项目，可通过 `pi install npm:pi-model-doctor` 安装已发布包，或将包目录加入该项目的 Pi settings。从 npm/Git 安装时**不会**使用 `../index.ts`；Pi 会读取包根目录清单中的 `pi.extensions: ["./index.ts"]`。
 
 ### 为什么实现位于仓库根目录
 
-`.pi/` 是 Pi 的项目级运行时/配置命名空间，而面向 GitHub/npm/pi.dev 发布的包需要独立的包根目录。现在实现位于仓库根目录，`package.json`、`README.md`、`LICENSE`、`src/`、测试和 Pi 清单可以一起打包。项目级 `.pi/settings.json` 指向 `../index.ts` 仅用于本仓库的开发冒烟测试；从 npm 或 Git 安装时，Pi 会解析包自身的 `pi.extensions` 清单。
+`.pi/` 是 Pi 的项目级运行时/配置命名空间，而面向 GitHub/npm/pi.dev 发布的包需要独立的包根目录。实现位于仓库根目录，`package.json`、`README.md`、`LICENSE`、`src/`、测试和 Pi 清单可以一起打包。项目级 `.pi/settings.json` 指向 `../index.ts` 仅用于本仓库的开发冒烟测试；从 npm 或 Git 安装时，Pi 会根据包自身的 `pi.extensions` 清单，从包根目录解析 `./index.ts`。
 
 ## 命令
 
 ```text
-/model-doctor add <provider-or-url> [model] [--metadata-provider <models.dev-provider>] [--api <protocol>] [--api-key <reference>] [--allow-literal-api-key] [--dry-run] [--yes]
+/model-doctor add <provider-or-url> [model-or-endpoint-url] [--metadata-provider <models.dev-provider>] [--api <protocol>] [--api-key <reference>] [--allow-literal-api-key] [--dry-run] [--yes]
 /model-doctor list [provider]
 /model-doctor check [provider/model]
 /model-doctor fix [provider/model] [--dry-run] [--yes]
@@ -37,7 +83,7 @@ Pi Model Doctor 是一个项目级 Pi 扩展，用于管理 `models.json` 中的
 
 `sync` 从 models.dev 发现 provider/channel 的全部模型，交互式 UI 可在本次运行中选择多个模型。非交互模式必须通过 `--models model-a,model-b` 显式指定；不会隐式选择 catalog 首项或全部模型。sync 是一次组合 proposal：一次确认、一次备份、一次原子写入，所有选中模型一起应用。`sync --dry-run` 不写入 models.json、备份或缓存。
 
-`add` 接受 models.dev provider id/name、provider API URL 或 model id。交互式 UI 中省略模型时会展示候选列表；非交互模式必须提供显式 model id。未在 models.dev 登记的第三方渠道：传入渠道 URL 和 model id 后，Model Doctor 可以使用其他 catalog provider 的精确模型记录作为 metadata-only 数据。如果只想先建立渠道，可以只传 URL：`add https://gateway.example/v1` 会创建一个空 provider 条目（仅 endpoint 和推断出的协议），之后通过 `add https://gateway.example/v1 <model>` 或 `sync https://gateway.example/v1` 添加模型。渠道的 endpoint、API 协议、headers、认证等传输字段始终属于用户，不会被覆盖。如果模型在多个 catalog provider 下存在，需要通过 `--metadata-provider <models.dev-provider>` 消歧；协议推断不足时通过 `--api <openai-completions|openai-responses|anthropic-messages|google-generative-ai>` 显式指定。Provider 官网数据不会自动抓取，也不会被当作 models.dev provider 记录；任何单独审核过的 provider 事实在通过受支持的 metadata source 提供之前都只是参考。API 凭据应使用引用形式，如 `$OPENAI_API_KEY`、`${OPENAI_API_KEY}`、`!command` 或 `pi-auth:provider`；除非显式传入 `--allow-literal-api-key`，否则字面 API key 不会被持久化。扩展永远不会打印 secret。使用 `--dry-run` 可预览 proposal 而不写入。非交互写入需要 `--yes`；`--dry-run` 优先级高于 `--yes`。`migrate` 接受显式 `--to provider/model`，UI 模式可展示目标候选；非交互模式必须提供 `--to`。
+`add` 接受 models.dev provider id/name、provider API URL 或 model id。交互式 UI 中省略模型时会展示候选列表；非交互模式必须提供显式 model id。未在 models.dev 登记的第三方渠道：传入渠道 URL 和 model id 后，Model Doctor 可以使用其他 catalog provider 的精确模型记录作为 metadata-only 数据。如果只想先建立渠道，可以只传 URL（`add https://gateway.example/v1`，自动派生 provider id），也可以显式命名（`add providerA https://gateway.example/v1`）。两种形式都会创建一个包含 endpoint 和推断协议、但没有模型的 provider；之后可通过 `add providerA <model>`、`add https://gateway.example/v1 <model>` 或 `sync providerA` 添加模型。渠道的 endpoint、API 协议、headers、认证等传输字段始终属于用户，不会被覆盖。如果模型在多个 catalog provider 下存在，需要通过 `--metadata-provider <models.dev-provider>` 消歧；协议推断不足时通过 `--api <openai-completions|openai-responses|anthropic-messages|google-generative-ai>` 显式指定。Provider 官网数据不会自动抓取，也不会被当作 models.dev provider 记录；任何单独审核过的 provider 事实在通过受支持的 metadata source 提供之前都只是参考。API 凭据应使用引用形式，如 `$OPENAI_API_KEY`、`${OPENAI_API_KEY}`、`!command` 或 `pi-auth:provider`；除非显式传入 `--allow-literal-api-key`，否则字面 API key 不会被持久化。扩展永远不会打印 secret。使用 `--dry-run` 可预览 proposal 而不写入。非交互写入需要 `--yes`；`--dry-run` 优先级高于 `--yes`。`migrate` 接受显式 `--to provider/model`，UI 模式可展示目标候选；非交互模式必须提供 `--to`。
 
 `check` 可离线检查本地文件，网络不可用时使用本地 models.dev 缓存；即使没有 catalog 也会报告本地所有权、元数据和 header findings。slash-command `refresh` 强制读取 catalog 并报告完整配置 findings，不应用修复；它从不写入 `models.json`，普通形式可以更新 catalog/policy 缓存。`refresh --dry-run` 完全只读，也不修改 catalog/policy 缓存。`fix` 只修改 Pi Model Doctor 拥有的字段。如果用户显式修改过 endpoint、header、compat 对象或模型能力，会报告为 conflict 且不会覆盖。`remove` 需要精确的 `provider/model` 目标。`migrate` 从当前元数据创建目标模型，保留安全用户字段，报告 endpoint/API/header 冲突但不复制 secret，默认保留源模型，显式 `--remove-source` 才会删除源；deprecated 目标仅作提示，不能自动应用。无操作的迁移报告无变更且不创建备份。每次修改都会验证 proposal 创建后 `models.json` 是否变化，然后使用备份、原子写入、持久化后 read-back 验证；持久化验证失败会自动恢复。当活动 Pi runtime 使用默认 agent models 路径时，命令会刷新并验证模型注册表，报告 `persisted-and-active`、`activation-failed` 或 `persisted-reload-required`；dry-run 和取消报告 `not-persisted`。备份清理是显式操作：`/model-doctor cleanup-backups --keep <count>` 或 `--max-age-ms <milliseconds>` 在授权后预览/删除旧的时间戳备份；从不自动运行。
 

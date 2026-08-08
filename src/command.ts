@@ -294,12 +294,14 @@ async function runSync(args: string[], flags: Record<string, string | boolean>, 
 
 async function runAdd(args: string[], flags: Record<string, string | boolean>, ctx: ExtensionCommandContext, doctor: ModelDoctor): Promise<void> {
   const target = args[0];
-  if (!target) throw new DoctorError("Usage: /model-doctor add <provider-or-url> [model] [--metadata-provider <models.dev-provider>] [--api <protocol>] [--api-key <reference>] [--allow-literal-api-key] [--dry-run] [--yes]", "invalid-target");
+  if (!target) throw new DoctorError("Usage: /model-doctor add <provider-or-url> [model-or-endpoint-url] [--metadata-provider <models.dev-provider>] [--api <protocol>] [--api-key <reference>] [--allow-literal-api-key] [--dry-run] [--yes]", "invalid-target");
   const dryRun = flags["dry-run"] === true;
-  let modelId = args[1];
-  let resolvedTarget = target;
+  const explicitEndpoint = !/^https?:\/\//i.test(target) && /^https?:\/\//i.test(args[1] ?? "") ? args[1] : undefined;
+  const explicitProviderId = explicitEndpoint ? target : undefined;
+  let modelId = explicitEndpoint ? undefined : args[1];
+  let resolvedTarget = explicitEndpoint ?? target;
   let selectedMetadataProvider = typeof flags["metadata-provider"] === "string" ? flags["metadata-provider"] : undefined;
-  if (!modelId && ctx.hasUI && !/^https?:\/\//i.test(target)) {
+  if (!modelId && !explicitEndpoint && ctx.hasUI && !/^https?:\/\//i.test(target)) {
     const candidates = await doctor.listCandidates(target, false, undefined, selectedMetadataProvider);
     if (candidates.length === 0) throw new DoctorError(`No models.dev models found for ${target}; provide an explicit model id`, "invalid-target");
     const choices = candidates.map((candidate, index) => formatCandidateLabel(candidate, index));
@@ -318,13 +320,14 @@ async function runAdd(args: string[], flags: Record<string, string | boolean>, c
     modelId = candidate.id;
     if (candidate.metadataOnly) selectedMetadataProvider = candidate.providerId;
   }
-  const providerOnly = !modelId && /^https?:\/\//i.test(target);
+  const providerOnly = !modelId && /^https?:\/\//i.test(resolvedTarget);
   if (!modelId && !providerOnly) throw new DoctorError("Model selection is required; provide an explicit model id in non-interactive mode", "selection-required");
   const selectedApi = typeof flags.api === "string" ? parsePiApiFlag(flags.api) : undefined;
   ensureHeadlessAuthorization(ctx, flags, "add", dryRun);
   const apiKey = typeof flags["api-key"] === "string" ? flags["api-key"] : undefined;
   const proposal = await doctor.proposeAdd({
     target: resolvedTarget,
+    providerId: explicitProviderId,
     modelId,
     metadataProvider: selectedMetadataProvider,
     api: selectedApi,
@@ -579,7 +582,7 @@ function formatRefresh(result: RefreshResult): string {
 
 function helpText(): string {
   return [
-    "/model-doctor add <provider-or-url> [model] [--metadata-provider <models.dev-provider>] [--api <protocol>] [--api-key <reference>] [--allow-literal-api-key] [--dry-run] [--yes]",
+    "/model-doctor add <provider-or-url> [model-or-endpoint-url] [--metadata-provider <models.dev-provider>] [--api <protocol>] [--api-key <reference>] [--allow-literal-api-key] [--dry-run] [--yes]",
     "/model-doctor list [provider]",
     "/model-doctor check [provider/model]",
     "/model-doctor fix [provider/model] [--dry-run] [--yes]",

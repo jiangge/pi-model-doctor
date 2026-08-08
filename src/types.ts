@@ -449,6 +449,8 @@ export type RuntimeActivationStatus = "persisted-and-active" | "persisted-reload
 
 export interface AddInput {
   target: string;
+  /** Explicit storage id for provider-only URL setup, as in `add providerA https://gateway.example/v1`. */
+  providerId?: string;
   /** When omitted and target is a URL, a provider-only entry with no model is created. */
   modelId?: string;
   /** Optional models.dev provider id used only to disambiguate metadata. */

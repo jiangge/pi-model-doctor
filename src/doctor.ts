@@ -274,6 +274,13 @@ export class ModelDoctor {
     if (looksLikeUrl(target)) validateExplicitProviderUrl(target);
     const requestedModelId = input.modelId?.trim();
     if (input.modelId !== undefined && (!requestedModelId || isUnsafeIdentifier(requestedModelId))) throw new DoctorError("Model id must be a safe non-empty identifier", "invalid-target");
+    const requestedProviderId = input.providerId?.trim();
+    if (input.providerId !== undefined && (!requestedProviderId || isUnsafeIdentifier(requestedProviderId) || /[\\/]/.test(requestedProviderId))) {
+      throw new DoctorError("Explicit provider id must be a safe non-empty identifier", "invalid-target");
+    }
+    if (requestedProviderId && (!looksLikeUrl(target) || requestedModelId)) {
+      throw new DoctorError("Explicit provider id is only supported for provider-only endpoint setup", "invalid-target");
+    }
     const requestedMetadataProvider = input.metadataProvider?.trim();
     if (input.metadataProvider !== undefined && (!requestedMetadataProvider || isUnsafeIdentifier(requestedMetadataProvider))) throw new DoctorError("Metadata provider must be a safe non-empty identifier", "invalid-target");
     if (input.api !== undefined && !isPiApi(input.api)) throw new DoctorError("API protocol must be a supported Pi API identifier", "invalid-target");
@@ -294,7 +301,9 @@ export class ModelDoctor {
     }
 
     const configuredProviders = getProviders(data);
-    const configuredEntry = findConfiguredProvider(configuredProviders, target);
+    const configuredByTarget = findConfiguredProvider(configuredProviders, target);
+    const configuredByExplicitId = requestedProviderId ? findConfiguredProviderById(configuredProviders, requestedProviderId) : undefined;
+    const configuredEntry = configuredByExplicitId ?? configuredByTarget;
     const match = catalog ? chooseMatch(catalog, target, requestedModelId, requestedMetadataProvider, Boolean(configuredEntry || looksLikeUrl(target))) : undefined;
     if (match?.ambiguous || match?.matchedBy.includes("model-ambiguous")) {
       throw new DoctorError(`Model selection for ${target}${requestedModelId ? `/${requestedModelId}` : ""} is ambiguous; choose an exact model id`, "selection-required");
@@ -331,10 +340,10 @@ export class ModelDoctor {
       // Provider-only add: create a provider entry with no model. A URL that
       // exactly matches a models.dev provider keeps the official provider id;
       // unlisted URLs get a channel-derived id.
-      if (configuredEntry) throw new DoctorError(`Provider ${target} is already configured; use sync to add models`, "invalid-target");
+      if (configuredEntry) throw new DoctorError(`Provider ${requestedProviderId ?? target} is already configured; use sync to add models`, "invalid-target");
       const endpoint = target;
       const channelApi = input.api ?? detectChannelApi(endpoint);
-      const providerName = provider?.name ?? providerIdFromUrl(target);
+      const providerName = requestedProviderId ?? provider?.name ?? providerIdFromUrl(target);
       const requestedApiKey = input.apiKey?.trim();
       if (input.apiKey !== undefined && !requestedApiKey) throw new DoctorError("API key reference must not be empty", "invalid-target");
       const apiKeyReference = requestedApiKey && (isCredentialReference(requestedApiKey) || input.allowLiteralApiKey === true)
@@ -353,8 +362,9 @@ export class ModelDoctor {
         models: [],
       };
       const next = cloneJson(data);
-      const catalogMatch = match?.provider !== undefined;
-      const pid = providerIdForAddTarget(target, undefined, configuredProviders, provider?.id ?? providerName, !catalogMatch, catalog ? Object.keys(catalog.providers) : []);
+      const catalogMatch = match?.provider !== undefined && requestedProviderId === undefined;
+      const pid = requestedProviderId
+        ?? providerIdForAddTarget(target, undefined, configuredProviders, provider?.id ?? providerName, !catalogMatch, catalog ? Object.keys(catalog.providers) : []);
       const plan = mergeProvider(next, pid, configuredProvider, this.now(), { preserveProviderIdentity: true });
       let proposalConfig = next;
       if (jsonEqual(stripDoctorMetadata(data), stripDoctorMetadata(next))) {
@@ -364,7 +374,7 @@ export class ModelDoctor {
       }
       return {
         target: pid,
-        matchedBy: ["provider-only-url"],
+        matchedBy: [requestedProviderId ? "provider-only-explicit-url" : "provider-only-url"],
         adapter: "fallback",
         confidence: "low",
         reasoningControlType: "unknown",
@@ -391,7 +401,7 @@ export class ModelDoctor {
         .join(" ");
     }
     const policy = await this.getPolicyCatalog(input.persistCache !== false && !input.dryRun);
-      const metadataOnly = match?.metadataOnly === true;
+    const metadataOnly = match?.metadataOnly === true;
     const transportOwned = metadataOnly || looksLikeUrl(target);
     const providerId = providerIdForAddTarget(
       target,

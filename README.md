@@ -1,12 +1,56 @@
 # Pi Model Doctor
 
-> **English** | [简体中文](README.zh-CN.md)
+> **English** | [简体中文](docs/README.zh-CN.md)
 
 Pi Model Doctor is a project-local Pi extension that manages the model lifecycle in `models.json`. It discovers provider metadata from [models.dev](https://models.dev), fills in model capabilities, checks existing entries, and applies safe repairs without replacing user-owned settings.
 
-## Load it
+## Table of contents
 
-This repository's `.pi/settings.json` loads the root package entry point automatically:
+- [Install, update, and uninstall](#install-update-and-uninstall)
+- [Development checkout](#development-checkout)
+- [Commands](#commands)
+- [Safe writes and ownership](#safe-writes-and-ownership)
+- [Cache and offline behavior](#cache-and-offline-behavior)
+- [Provider capabilities](#provider-capabilities)
+- [Development](#development)
+
+## Install, update, and uninstall
+
+Install from npm into the current Pi installation:
+
+```bash
+pi install npm:pi-model-doctor
+```
+
+Install into the current project's `.pi/settings.json` instead:
+
+```bash
+pi install npm:pi-model-doctor -l
+```
+
+Update the installed package later with:
+
+```bash
+pi update npm:pi-model-doctor
+```
+
+Remove it from the same scope in which it was installed:
+
+```bash
+# Global/user installation
+pi remove npm:pi-model-doctor
+# Equivalent alias
+pi uninstall npm:pi-model-doctor
+
+# Project-local installation
+pi remove npm:pi-model-doctor -l
+```
+
+After installing or removing a package, restart Pi or start a new session so the extension registration is rebuilt. Removing the package does not remove models already written to `models.json`; use `/model-doctor remove <provider/model>` for configuration entries, and keep the timestamped backup if you may need to roll back.
+
+## Development checkout
+
+For this repository's development smoke test, the relevant entry in `.pi/settings.json` is:
 
 ```json
 {
@@ -14,16 +58,18 @@ This repository's `.pi/settings.json` loads the root package entry point automat
 }
 ```
 
-For another Pi project, install the published package with `pi install npm:pi-model-doctor`, or add the package directory to that project's Pi settings. The package manifest exposes `index.ts` through the `pi.extensions` field.
+Pi resolves relative paths in a project `.pi/settings.json` from the `.pi/` directory, so `../index.ts` correctly points to this repository's root `index.ts`. This is only a development registration excerpt; the actual project settings may contain other extensions, skills, prompts, and packages.
+
+For another Pi project, install the published package with `pi install npm:pi-model-doctor`, or add the package directory to that project's Pi settings. Installed npm/Git packages do **not** use `../index.ts`; Pi reads the package-root manifest `pi.extensions: ["./index.ts"]` instead.
 
 ### Why the implementation is now at the repository root
 
-`.pi/` is Pi's project-local runtime/configuration namespace, but a package intended for GitHub/npm/pi.dev should have its own package root. The implementation now lives at the repository root so `package.json`, `README.md`, `LICENSE`, `src/`, tests, and the Pi manifest are packaged together. The project-local `.pi/settings.json` points to `../index.ts` only for this repository's development smoke test; when installed from npm or Git, Pi resolves the package's own `pi.extensions` manifest.
+`.pi/` is Pi's project-local runtime/configuration namespace, but a package intended for GitHub/npm/pi.dev should have its own package root. The implementation lives at the repository root so `package.json`, `README.md`, `LICENSE`, `src/`, tests, and the Pi manifest are packaged together. The project-local `.pi/settings.json` points to `../index.ts` only for this repository's development smoke test; when installed from npm or Git, Pi resolves `./index.ts` from the package's own `pi.extensions` manifest.
 
 ## Commands
 
 ```text
-/model-doctor add <provider-or-url> [model] [--metadata-provider <models.dev-provider>] [--api <protocol>] [--api-key <reference>] [--allow-literal-api-key] [--dry-run] [--yes]
+/model-doctor add <provider-or-url> [model-or-endpoint-url] [--metadata-provider <models.dev-provider>] [--api <protocol>] [--api-key <reference>] [--allow-literal-api-key] [--dry-run] [--yes]
 /model-doctor list [provider]
 /model-doctor check [provider/model]
 /model-doctor fix [provider/model] [--dry-run] [--yes]
@@ -37,7 +83,7 @@ For another Pi project, install the published package with `pi install npm:pi-mo
 
 `sync` discovers all models for a provider/channel from models.dev and lets the interactive UI select multiple models for this run. In non-interactive mode, pass `--models model-a,model-b`; there is no implicit catalog-first-model selection. Sync writes one combined proposal with one backup and one atomic write, so the selected models are applied together. `sync --dry-run` never writes models.json, backups, or caches.
 
-`add` accepts a models.dev provider id/name, a provider API URL, or a model id. When a model is omitted in the interactive UI, the extension presents candidates for selection; non-interactive mode requires an explicit model id. A third-party channel may not have a provider record in models.dev: in that case, pass its channel URL and model id, and Model Doctor can use an exact model record from another catalog provider as metadata only. To set up a channel before adding any model, pass only the channel URL: `add https://gateway.example/v1` creates an empty provider entry (endpoint and inferred protocol only), and models can then be attached with `add https://gateway.example/v1 <model>` or `sync https://gateway.example/v1`. The channel endpoint, API protocol, headers, authentication, and other transport fields remain user-owned and are not replaced. If the model exists under multiple catalog providers, pass `--metadata-provider <models.dev-provider>`; pass `--api <openai-completions|openai-responses|anthropic-messages|google-generative-ai>` when protocol inference is insufficient. Provider website metadata can be reviewed and supplied separately, but is not fetched automatically or treated as a models.dev provider record. API credentials should be references such as `$OPENAI_API_KEY`, `${OPENAI_API_KEY}`, `!command`, or `pi-auth:provider`; literal API keys are not persisted unless `--allow-literal-api-key` is explicitly supplied. Secrets are never printed by the extension. Use `--dry-run` to inspect a proposal without writing. Non-interactive writes require `--yes`; `--dry-run` takes precedence over `--yes`. `migrate` accepts an explicit `--to provider/model`, or presents destination candidates in UI mode; non-interactive mode requires `--to`.
+`add` accepts a models.dev provider id/name, a provider API URL, or a model id. When a model is omitted in the interactive UI, the extension presents candidates for selection; non-interactive mode requires an explicit model id. A third-party channel may not have a provider record in models.dev: in that case, pass its channel URL and model id, and Model Doctor can use an exact model record from another catalog provider as metadata only. To set up a channel before adding any model, either pass only the channel URL (`add https://gateway.example/v1`, deriving a provider id) or explicitly name it (`add providerA https://gateway.example/v1`). Both forms create an empty provider entry with endpoint and inferred protocol; models can then be attached with `add providerA <model>`, `add https://gateway.example/v1 <model>`, or `sync providerA`. The channel endpoint, API protocol, headers, authentication, and other transport fields remain user-owned and are not replaced. If the model exists under multiple catalog providers, pass `--metadata-provider <models.dev-provider>`; pass `--api <openai-completions|openai-responses|anthropic-messages|google-generative-ai>` when protocol inference is insufficient. Provider website metadata can be reviewed and supplied separately, but is not fetched automatically or treated as a models.dev provider record. API credentials should be references such as `$OPENAI_API_KEY`, `${OPENAI_API_KEY}`, `!command`, or `pi-auth:provider`; literal API keys are not persisted unless `--allow-literal-api-key` is explicitly supplied. Secrets are never printed by the extension. Use `--dry-run` to inspect a proposal without writing. Non-interactive writes require `--yes`; `--dry-run` takes precedence over `--yes`. `migrate` accepts an explicit `--to provider/model`, or presents destination candidates in UI mode; non-interactive mode requires `--to`.
 
 `check` works offline for the local file and uses the local models.dev cache when the network is unavailable; even without a catalog it reports local ownership, metadata, and header findings. The slash-command `refresh` forces a catalog read and reports full configuration findings without applying repairs; it never writes `models.json`, while the normal form may update catalog/policy caches. `refresh --dry-run` is fully read-only and also leaves catalog/policy caches unchanged. `fix` only changes fields owned by Pi Model Doctor. If a user explicitly changed an endpoint, header, compatibility object, or model capability, the change is reported as a conflict and is not overwritten. `remove` requires an exact `provider/model` target. `migrate` creates a destination model from current metadata, preserves safe user fields, reports endpoint/API/header conflicts without copying secrets, keeps the source by default, and requires `--remove-source` for explicit source removal; deprecated destinations are advisory and cannot be auto-applied. A no-op migration reports no changes and does not create a backup. Every mutation verifies that `models.json` did not change after proposal creation, then uses a backup, atomic write, persisted read-back verification, and automatic restoration if persistence verification fails. When the active Pi runtime uses the default agent models path, the command refreshes and verifies the model registry, reporting `persisted-and-active`, `activation-failed`, or `persisted-reload-required`; dry-run and cancellation report `not-persisted`. Backup cleanup is explicit only: `/model-doctor cleanup-backups --keep <count>` or `--max-age-ms <milliseconds>` previews/removes old timestamped backups after authorization; it never runs automatically.
 

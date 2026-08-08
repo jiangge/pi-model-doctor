@@ -1,6 +1,6 @@
 {
   "name": "pi-model-doctor",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "type": "module",
   "description": "Safe lifecycle management for Pi models.json using models.dev metadata.",
   "author": "jiangge",
@@ -21,7 +21,7 @@
     "index.ts",
     "src",
     "README.md",
-    "README.zh-CN.md",
+    "docs/README.zh-CN.md",
     "LICENSE"
   ],
   "license": "MIT",

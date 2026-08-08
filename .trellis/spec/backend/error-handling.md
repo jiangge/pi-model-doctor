@@ -31,6 +31,7 @@ The extension crosses three failure-prone boundaries: user command input, local 
 | models.dev HTTP/network failure with valid cache | stale cache + warning |
 | models.dev failure without cache for add/check/fix | warning finding or fallback proposal (add) |
 | unlisted third-party URL with unique exact model metadata | metadata-only model proposal; preserve endpoint/API/headers/authentication |
+| `add <provider-id> <endpoint-url>` | provider-only setup under the explicit safe id; reject duplicate id/endpoint collisions without mutation |
 | unlisted third-party URL with ambiguous model metadata | `selection-required`; require `--metadata-provider` |
 | third-party `--api` override | use explicit channel API; do not copy catalog provider API |
 | user-owned endpoint/header/capability differs | warning conflict; do not overwrite |

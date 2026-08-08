@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, readdir, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { formatFindings, parseCommandArgs, runCommand } from "../src/command.ts";
 import {
@@ -495,6 +495,52 @@ test("adds a provider-only entry when a URL is given without a model id", async 
   assert.equal(updated.data.providers?.gateway?.models?.[0]?.id, "gpt-test");
 });
 
+test("explicit provider id plus endpoint creates a provider-only channel and supports later model add", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-explicit-provider-endpoint-"));
+  const targetPaths = paths(root);
+  const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(catalog()) } });
+
+  const proposal = await doctor.proposeAdd({
+    target: "https://test.example/v1",
+    providerId: "providerA",
+    apiKey: "$PROVIDER_A_KEY",
+    persistCache: false,
+  });
+  assert.equal(proposal.providerId, "providerA");
+  assert.equal(proposal.modelId, "");
+  assert.equal(proposal.metadataOnly, true);
+  assert.equal(proposal.config.providers?.providerA?.name, "providerA");
+  assert.equal(proposal.config.providers?.providerA?.baseUrl, "https://test.example/v1");
+  assert.equal(proposal.config.providers?.providerA?.apiKey, "$PROVIDER_A_KEY");
+  assert.deepEqual(proposal.config.providers?.providerA?.models, []);
+  await doctor.applyAdd(proposal);
+
+  await assert.rejects(
+    () => doctor.proposeAdd({ target: "https://different.example/v1", providerId: "providerA", persistCache: false }),
+    (error: unknown) => error instanceof DoctorError && /already configured/.test(error.message),
+  );
+  await assert.rejects(
+    () => doctor.proposeAdd({ target: "https://test.example/v1", providerId: "providerB", persistCache: false }),
+    (error: unknown) => error instanceof DoctorError && /already configured/.test(error.message),
+  );
+
+  const withModel = await doctor.proposeAdd({ target: "providerA", modelId: "gpt-test", persistCache: false });
+  assert.equal(withModel.providerId, "providerA");
+  assert.equal(withModel.config.providers?.providerA?.baseUrl, "https://test.example/v1");
+  assert.equal(withModel.config.providers?.providerA?.apiKey, "$PROVIDER_A_KEY");
+  assert.equal(withModel.config.providers?.providerA?.models?.[0]?.id, "gpt-test");
+
+  const commandRoot = await mkdtemp(join(tmpdir(), "pi-model-doctor-explicit-provider-command-"));
+  const commandDoctor = new ModelDoctor({ paths: paths(commandRoot), fetcher: { fetchImpl: fetchMock(catalog()) } });
+  const notifications: string[] = [];
+  const ctx = { hasUI: false, ui: { notify: (message: string) => notifications.push(message) } } as never;
+  await runCommand("add providerA https://test.example/v1 --yes --api-key $PROVIDER_A_KEY", ctx, commandDoctor);
+  const commandSaved = await readModelsJson(paths(commandRoot).modelsPath);
+  assert.equal(commandSaved.data.providers?.providerA?.baseUrl, "https://test.example/v1");
+  assert.equal(commandSaved.data.providers?.providerA?.apiKey, "$PROVIDER_A_KEY");
+  assert.match(notifications.at(-1) ?? "", /Applied/);
+});
+
 test("provider-only URL add accepts an API key reference and keeps official catalog identity", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-provider-only-key-"));
   const targetPaths = paths(root);
@@ -892,8 +938,10 @@ test("extension registers the unified command and lifecycle hooks from project s
   modelDoctorExtension({ registerCommand: (name: string) => registered.push(name), on: (event: string) => hooks.push(event) } as never);
   assert.deepEqual(registered, ["model-doctor"]);
   assert.deepEqual(hooks, ["session_start", "session_shutdown"]);
-  const settings = JSON.parse(await readFile(join(process.cwd(), ".pi", "settings.json"), "utf8")) as { extensions?: string[] };
+  const settingsPath = join(process.cwd(), ".pi", "settings.json");
+  const settings = JSON.parse(await readFile(settingsPath, "utf8")) as { extensions?: string[] };
   assert.equal(settings.extensions?.includes("../index.ts"), true);
+  assert.equal(resolve(dirname(settingsPath), "../index.ts"), join(process.cwd(), "index.ts"));
 });
 
 test("Pi extension loader registers model-doctor without network access", async () => {
