@@ -1,8 +1,17 @@
 {
   "name": "pi-model-doctor",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "Safe lifecycle management for Pi models.json using models.dev metadata.",
+  "author": "jiangge",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jiangge/pi-model-doctor.git"
+  },
+  "homepage": "https://github.com/jiangge/pi-model-doctor#readme",
+  "bugs": {
+    "url": "https://github.com/jiangge/pi-model-doctor/issues"
+  },
   "keywords": [
     "pi-package",
     "pi-extension",
