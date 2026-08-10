@@ -2,12 +2,12 @@
 
 > [English](../README.md) | **简体中文**
 
-Pi Model Doctor 是一个项目级 Pi 扩展，用于管理 `models.json` 中的模型生命周期。它从 [models.dev](https://models.dev) 发现 provider 元数据、补全模型能力、检查现有配置，并在不覆盖用户自有设置的前提下执行安全修复。
+Pi Model Doctor 是一个 Pi 扩展，用于管理 `models.json` 中的模型生命周期。普通的 `pi install npm:pi-model-doctor` 会安装到当前用户的 Pi 全局设置；只有显式使用 `-l` 才会安装为项目级包。它从 [models.dev](https://models.dev) 发现 provider 元数据、补全模型能力、检查现有配置，并在不覆盖用户自有设置的前提下执行安全修复。
 
 ## 目录
 
 - [安装、更新与卸载](#安装更新与卸载)
-- [本地开发检出](#本地开发检出)
+- [全局安装与项目级覆盖](#全局安装与项目级覆盖)
 - [命令](#命令)
 - [安全写入与所有权](#安全写入与所有权)
 - [缓存与离线行为](#缓存与离线行为)
@@ -16,13 +16,13 @@ Pi Model Doctor 是一个项目级 Pi 扩展，用于管理 `models.json` 中的
 
 ## 安装、更新与卸载
 
-从 npm 安装到当前 Pi 用户环境：
+从 npm 安装到当前 Pi 用户的全局 Pi 环境（默认且推荐）：
 
 ```bash
 pi install npm:pi-model-doctor
 ```
 
-安装到当前项目的 `.pi/settings.json`：
+这会把包写入用户 Pi 包目录，并加入 `~/.pi/agent/settings.json`，因此同一用户的其他项目也可以使用。只有需要项目级固定版本时，才安装到当前项目的 `.pi/settings.json`：
 
 ```bash
 pi install npm:pi-model-doctor -l
@@ -48,6 +48,18 @@ pi remove npm:pi-model-doctor -l
 
 安装或卸载后，请重启 Pi 或开启新会话，使扩展注册信息重新加载。卸载扩展不会删除已经写入 `models.json` 的模型；如需删除配置条目，请使用 `/model-doctor remove <provider/model>`，并保留时间戳备份以便回滚。
 
+## 全局安装与项目级覆盖
+
+本仓库的 `.pi/settings.json` 只包含本项目的开发工具配置。全局安装 npm 包后，不需要再添加 Model Doctor 的 `../index.ts`。Pi 全局设置会通过包根目录清单加载 npm 包：
+
+```json
+{
+  "packages": ["npm:pi-model-doctor"]
+}
+```
+
+只有明确执行 `pi install npm:pi-model-doctor -l` 时，才会把包引用写入当前项目的 `.pi/settings.json`，形成项目级覆盖。不要同时保留全局 npm 包和本地 `../index.ts` 条目，否则扩展可能被加载两次。
+
 ## 本地开发检出
 
 用于本仓库开发冒烟测试时，`.pi/settings.json` 中与 Model Doctor 相关的条目是：
@@ -58,9 +70,7 @@ pi remove npm:pi-model-doctor -l
 }
 ```
 
-Pi 会以项目的 `.pi/` 目录作为 `.pi/settings.json` 相对路径的基准，因此 `../index.ts` 会正确指向仓库根目录的 `index.ts`。这只是开发注册相关的最小摘录；实际项目配置还可以包含其他 extensions、skills、prompts 和 packages。
-
-对于其他 Pi 项目，可通过 `pi install npm:pi-model-doctor` 安装已发布包，或将包目录加入该项目的 Pi settings。从 npm/Git 安装时**不会**使用 `../index.ts`；Pi 会读取包根目录清单中的 `pi.extensions: ["./index.ts"]`。
+Pi 会以项目的 `.pi/` 目录作为 `.pi/settings.json` 相对路径的基准；因此如果开发时使用 `../index.ts`，它会指向仓库根目录的 `index.ts`。但普通全局 npm 安装不需要这条本地路径。对于其他 Pi 项目，可通过 `pi install npm:pi-model-doctor` 安装已发布包，或将包目录加入该项目的 Pi settings。从 npm/Git 安装时**不会**使用 `../index.ts`；Pi 会读取包根目录清单中的 `pi.extensions: ["./index.ts"]`。
 
 ### 为什么实现位于仓库根目录
 

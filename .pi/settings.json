@@ -1,8 +1,7 @@
 {
   "enableSkillCommands": true,
   "extensions": [
-    "./extensions/trellis/index.ts",
-    "../index.ts"
+    "./extensions/trellis/index.ts"
   ],
   "skills": [
     "./skills"

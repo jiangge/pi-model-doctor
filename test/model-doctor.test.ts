@@ -940,7 +940,7 @@ test("extension registers the unified command and lifecycle hooks from project s
   assert.deepEqual(hooks, ["session_start", "session_shutdown"]);
   const settingsPath = join(process.cwd(), ".pi", "settings.json");
   const settings = JSON.parse(await readFile(settingsPath, "utf8")) as { extensions?: string[] };
-  assert.equal(settings.extensions?.includes("../index.ts"), true);
+  assert.equal(settings.extensions?.includes("../index.ts"), false);
   assert.equal(resolve(dirname(settingsPath), "../index.ts"), join(process.cwd(), "index.ts"));
 });
 

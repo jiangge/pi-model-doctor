@@ -2,12 +2,12 @@
 
 > **English** | [简体中文](docs/README.zh-CN.md)
 
-Pi Model Doctor is a project-local Pi extension that manages the model lifecycle in `models.json`. It discovers provider metadata from [models.dev](https://models.dev), fills in model capabilities, checks existing entries, and applies safe repairs without replacing user-owned settings.
+Pi Model Doctor is a Pi extension that manages the model lifecycle in `models.json`. A normal `pi install npm:pi-model-doctor` installs it to the current user's global Pi settings; use `-l` only when you explicitly want a project-local installation. It discovers provider metadata from [models.dev](https://models.dev), fills in model capabilities, checks existing entries, and applies safe repairs without replacing user-owned settings.
 
 ## Table of contents
 
 - [Install, update, and uninstall](#install-update-and-uninstall)
-- [Development checkout](#development-checkout)
+- [Global installation and project-local override](#global-installation-and-project-local-override)
 - [Commands](#commands)
 - [Safe writes and ownership](#safe-writes-and-ownership)
 - [Cache and offline behavior](#cache-and-offline-behavior)
@@ -16,13 +16,14 @@ Pi Model Doctor is a project-local Pi extension that manages the model lifecycle
 
 ## Install, update, and uninstall
 
-Install from npm into the current Pi installation:
+Install from npm into the current user's global Pi installation (the default and recommended mode):
 
 ```bash
 pi install npm:pi-model-doctor
 ```
 
-Install into the current project's `.pi/settings.json` instead:
+This writes the package source to the user's Pi package directory and adds it to `~/.pi/agent/settings.json`, so it is available in other projects for the same user. Install into the current project's `.pi/settings.json` only when you explicitly need a project-local pin:
+
 
 ```bash
 pi install npm:pi-model-doctor -l
@@ -48,6 +49,18 @@ pi remove npm:pi-model-doctor -l
 
 After installing or removing a package, restart Pi or start a new session so the extension registration is rebuilt. Removing the package does not remove models already written to `models.json`; use `/model-doctor remove <provider/model>` for configuration entries, and keep the timestamped backup if you may need to roll back.
 
+## Global installation and project-local override
+
+The repository's `.pi/settings.json` contains only this project's development tooling. It does not need a `../index.ts` Model Doctor entry when the package is globally installed. Pi's global settings load the npm package through its package-root manifest:
+
+```json
+{
+  "packages": ["npm:pi-model-doctor"]
+}
+```
+
+Use `pi install npm:pi-model-doctor -l` only for a project-local override; in that case Pi writes the package reference to `.pi/settings.json` for that project. Do not add both the global package and a local `../index.ts` entry, or the extension may be loaded twice.
+
 ## Development checkout
 
 For this repository's development smoke test, the relevant entry in `.pi/settings.json` is:
@@ -58,9 +71,7 @@ For this repository's development smoke test, the relevant entry in `.pi/setting
 }
 ```
 
-Pi resolves relative paths in a project `.pi/settings.json` from the `.pi/` directory, so `../index.ts` correctly points to this repository's root `index.ts`. This is only a development registration excerpt; the actual project settings may contain other extensions, skills, prompts, and packages.
-
-For another Pi project, install the published package with `pi install npm:pi-model-doctor`, or add the package directory to that project's Pi settings. Installed npm/Git packages do **not** use `../index.ts`; Pi reads the package-root manifest `pi.extensions: ["./index.ts"]` instead.
+Pi resolves relative paths in a project `.pi/settings.json` from the `.pi/` directory. A `../index.ts` entry would therefore point to this repository's root source, but it is not needed for normal global npm installation. For another Pi project, install the published package with `pi install npm:pi-model-doctor`, or add the package directory to that project's Pi settings. Installed npm/Git packages do **not** use `../index.ts`; Pi reads the package-root manifest `pi.extensions: ["./index.ts"]` instead.
 
 ### Why the implementation is now at the repository root
 
