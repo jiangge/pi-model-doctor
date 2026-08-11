@@ -1494,10 +1494,12 @@ function checkModel(providerId: string, provider: PiProvider, model: PiModel, so
   }
   const expectedReasoning = resolveReasoning(sourceProvider, sourceModel);
   if (!transportOwned && model.api !== expectedApi) {
-    findings.push(finding("api-mismatch", "warning", target, `Configured model API is ${model.api ?? "unset"}; expected ${expectedApi}`, canManageField(model, "api"), model.api !== undefined && !canManageField(model, "api")));
+    const repairable = canManageField(model, "api");
+    findings.push(finding("api-mismatch", "warning", target, `Configured model API is ${model.api ?? "unset"}; expected ${expectedApi}`, repairable, !repairable));
   }
   if (expectedModel.input && !jsonEqual(model.input, expectedModel.input)) {
-    findings.push(finding("input-mismatch", "warning", target, `Configured input modalities are ${model.input?.join(", ") ?? "unset"}; models.dev expects ${expectedModel.input.join(", ")}`, canManageField(model, "input"), model.input !== undefined && !canManageField(model, "input")));
+    const repairable = canManageField(model, "input");
+    findings.push(finding("input-mismatch", "warning", target, `Configured input modalities are ${model.input?.join(", ") ?? "unset"}; models.dev expects ${expectedModel.input.join(", ")}`, repairable, !repairable));
   }
   if (model.reasoning !== expectedReasoning.supported) findings.push(finding("reasoning-mismatch", "warning", target, `Reasoning is ${model.reasoning ? "enabled" : "disabled"}; metadata says ${expectedReasoning.supported ? "enabled" : "disabled"}`, canManageField(model, "reasoning"), !canManageField(model, "reasoning")));
   if (!jsonEqual(model.thinkingLevelMap, expectedModel.thinkingLevelMap)) {

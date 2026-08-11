@@ -1112,6 +1112,42 @@ test("user-deleted managed provider identity fields remain non-repairable", asyn
   assert.ok(identityFindings.every((item) => item.repairable === false && item.userOwned === true));
 });
 
+test("user-deleted managed model API and input fields remain user-owned", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-model-deleted-fields-"));
+  const targetPaths = paths(root);
+  await writeFile(targetPaths.modelsPath, JSON.stringify({
+    providers: {
+      openai: {
+        name: "OpenAI",
+        baseUrl: "https://api.openai.com/v1",
+        api: "openai-completions",
+        models: [{
+          id: "gpt-test",
+          _piModelDoctor: {
+            managed: true,
+            source: "models.dev",
+            lastCheck: "2026-08-01T00:00:00.000Z",
+            autoRepair: true,
+            version: 1,
+            managedFields: ["api", "input"],
+            managedValues: {
+              api: "openai-completions",
+              input: ["text"],
+            },
+          },
+        }],
+      },
+    },
+  }));
+  const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(catalog()) } });
+  const result = await doctor.check("openai/gpt-test");
+  const deletedFieldFindings = result.findings.filter((item) => (
+    item.code === "api-mismatch" && item.message.startsWith("Configured model API")
+  ) || item.code === "input-mismatch");
+  assert.equal(deletedFieldFindings.length, 2);
+  assert.ok(deletedFieldFindings.every((item) => item.repairable === false && item.userOwned === true));
+});
+
 test("migrate creates a destination, preserves user fields, and can remove the source explicitly", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-migrate-"));
   const targetPaths = paths(root);
