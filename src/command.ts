@@ -294,11 +294,11 @@ async function runSync(args: string[], flags: Record<string, string | boolean>, 
 
 async function runAdd(args: string[], flags: Record<string, string | boolean>, ctx: ExtensionCommandContext, doctor: ModelDoctor): Promise<void> {
   const target = args[0];
-  if (!target) throw new DoctorError("Usage: /model-doctor add <provider-or-url> [model-or-endpoint-url] [--metadata-provider <models.dev-provider>] [--api <protocol>] [--api-key <reference>] [--allow-literal-api-key] [--dry-run] [--yes]", "invalid-target");
+  if (!target) throw new DoctorError("Usage: /model-doctor add <provider-or-url> [model] | add <provider-id> <endpoint-url> [model] [--metadata-provider <models.dev-provider>] [--api <protocol>] [--api-key <reference>] [--allow-literal-api-key] [--dry-run] [--yes]", "invalid-target");
   const dryRun = flags["dry-run"] === true;
   const explicitEndpoint = !/^https?:\/\//i.test(target) && /^https?:\/\//i.test(args[1] ?? "") ? args[1] : undefined;
   const explicitProviderId = explicitEndpoint ? target : undefined;
-  let modelId = explicitEndpoint ? undefined : args[1];
+  let modelId = explicitEndpoint ? args[2] : args[1];
   let resolvedTarget = explicitEndpoint ?? target;
   let selectedMetadataProvider = typeof flags["metadata-provider"] === "string" ? flags["metadata-provider"] : undefined;
   if (!modelId && !explicitEndpoint && ctx.hasUI && !/^https?:\/\//i.test(target)) {
@@ -548,7 +548,7 @@ function validateCommand(parsed: ParsedCommand): void {
     if (unknown) throw new DoctorError(`Unknown flag --${unknown}; use /model-doctor help for usage`, "invalid-target");
   }
   const maxArgs = parsed.command === "migrate" ? 2
-    : parsed.command === "add" ? 2
+    : parsed.command === "add" ? 3
       : parsed.command === "sync" ? 1
         : parsed.command === "rollback" ? 1
           : ["list", "check", "fix", "remove"].includes(parsed.command) ? 1
@@ -558,6 +558,9 @@ function validateCommand(parsed: ParsedCommand): void {
   }
   if (parsed.command === "migrate" && parsed.args[1] && parsed.flags.to !== undefined) {
     throw new DoctorError("Migration destination must be provided either positionally or with --to, not both", "invalid-target");
+  }
+  if (parsed.command === "add" && parsed.args.length === 3 && (/^https?:\/\//i.test(parsed.args[0] ?? "") || !/^https?:\/\//i.test(parsed.args[1] ?? ""))) {
+    throw new DoctorError("Three add arguments require: add <provider-id> <endpoint-url> [model]", "invalid-target");
   }
   for (const [name, value] of Object.entries(parsed.flags)) {
     if (BOOLEAN_FLAGS.has(name) && typeof value !== "boolean") {
@@ -582,7 +585,8 @@ function formatRefresh(result: RefreshResult): string {
 
 function helpText(): string {
   return [
-    "/model-doctor add <provider-or-url> [model-or-endpoint-url] [--metadata-provider <models.dev-provider>] [--api <protocol>] [--api-key <reference>] [--allow-literal-api-key] [--dry-run] [--yes]",
+    "/model-doctor add <provider-or-url> [model] [--metadata-provider <models.dev-provider>] [--api <protocol>] [--api-key <reference>] [--allow-literal-api-key] [--dry-run] [--yes]",
+    "/model-doctor add <provider-id> <endpoint-url> [model] [--metadata-provider <models.dev-provider>] [--api <protocol>] [--api-key <reference>] [--allow-literal-api-key] [--dry-run] [--yes]",
     "/model-doctor list [provider]",
     "/model-doctor check [provider/model]",
     "/model-doctor fix [provider/model] [--dry-run] [--yes]",

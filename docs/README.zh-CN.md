@@ -79,7 +79,8 @@ Pi 会以项目的 `.pi/` 目录作为 `.pi/settings.json` 相对路径的基准
 ## 命令
 
 ```text
-/model-doctor add <provider-or-url> [model-or-endpoint-url] [--metadata-provider <models.dev-provider>] [--api <protocol>] [--api-key <reference>] [--allow-literal-api-key] [--dry-run] [--yes]
+/model-doctor add <provider-or-url> [model] [--metadata-provider <models.dev-provider>] [--api <protocol>] [--api-key <reference>] [--allow-literal-api-key] [--dry-run] [--yes]
+/model-doctor add <provider-id> <endpoint-url> [model] [--metadata-provider <models.dev-provider>] [--api <protocol>] [--api-key <reference>] [--allow-literal-api-key] [--dry-run] [--yes]
 /model-doctor list [provider]
 /model-doctor check [provider/model]
 /model-doctor fix [provider/model] [--dry-run] [--yes]
@@ -93,7 +94,7 @@ Pi 会以项目的 `.pi/` 目录作为 `.pi/settings.json` 相对路径的基准
 
 `sync` 从 models.dev 发现 provider/channel 的全部模型，交互式 UI 可在本次运行中选择多个模型。非交互模式必须通过 `--models model-a,model-b` 显式指定；不会隐式选择 catalog 首项或全部模型。sync 是一次组合 proposal：一次确认、一次备份、一次原子写入，所有选中模型一起应用。`sync --dry-run` 不写入 models.json、备份或缓存。
 
-`add` 接受 models.dev provider id/name、provider API URL 或 model id。交互式 UI 中省略模型时会展示候选列表；非交互模式必须提供显式 model id。未在 models.dev 登记的第三方渠道：传入渠道 URL 和 model id 后，Model Doctor 可以使用其他 catalog provider 的精确模型记录作为 metadata-only 数据。如果只想先建立渠道，可以只传 URL（`add https://gateway.example/v1`，自动派生 provider id），也可以显式命名（`add providerA https://gateway.example/v1`）。两种形式都会创建一个包含 endpoint 和推断协议、但没有模型的 provider；之后可通过 `add providerA <model>`、`add https://gateway.example/v1 <model>` 或 `sync providerA` 添加模型。渠道的 endpoint、API 协议、headers、认证等传输字段始终属于用户，不会被覆盖。如果模型在多个 catalog provider 下存在，需要通过 `--metadata-provider <models.dev-provider>` 消歧；协议推断不足时通过 `--api <openai-completions|openai-responses|anthropic-messages|google-generative-ai>` 显式指定。Provider 官网数据不会自动抓取，也不会被当作 models.dev provider 记录；任何单独审核过的 provider 事实在通过受支持的 metadata source 提供之前都只是参考。API 凭据应使用引用形式，如 `$OPENAI_API_KEY`、`${OPENAI_API_KEY}`、`!command` 或 `pi-auth:provider`；除非显式传入 `--allow-literal-api-key`，否则字面 API key 不会被持久化。扩展永远不会打印 secret。使用 `--dry-run` 可预览 proposal 而不写入。非交互写入需要 `--yes`；`--dry-run` 优先级高于 `--yes`。`migrate` 接受显式 `--to provider/model`，UI 模式可展示目标候选；非交互模式必须提供 `--to`。
+`add` 接受 models.dev provider id/name、provider API URL 或 model id。交互式 UI 中省略模型时会展示候选列表；非交互模式必须提供显式 model id。未在 models.dev 登记的第三方渠道：传入渠道 URL 和 model id 后，Model Doctor 可以使用其他 catalog provider 的精确模型记录作为 metadata-only 数据。可以一步添加指定渠道的模型：`add https://gateway.example/v1 <model>`；也可以显式指定存储 provider id：`add providerA https://gateway.example/v1 <model>`。如果只想先建立渠道，可以只传 URL（`add https://gateway.example/v1`，自动派生 provider id），也可以显式命名（`add providerA https://gateway.example/v1`）。两种 provider-only 形式都会创建一个包含 endpoint 和推断协议、但没有模型的 provider；之后可通过 `add providerA <model>`、`add https://gateway.example/v1 <model>` 或 `sync providerA` 添加模型。渠道的 endpoint、API 协议、headers、认证等传输字段始终属于用户，不会被覆盖。如果模型在多个 catalog provider 下存在，需要通过 `--metadata-provider <models.dev-provider>` 消歧；协议推断不足时通过 `--api <openai-completions|openai-responses|anthropic-messages|google-generative-ai>` 显式指定。对于一步添加渠道模型，如果给出的是没有路径的根 URL，且解析出的模型/协议属于 OpenAI-compatible（`openai-completions` 或 `openai-responses`），会自动补全 `/v1`；Anthropic 和 Google 协议不会补全。已有 `/v1` 和其他显式路径保持不变；插入 `/v1` 时查询参数和 fragment 仍会保留在 URL 末尾；只传 URL 建立 provider-only 渠道时没有模型类型，因此不会自动补全。显式 `--api` 优先决定这个行为；已经配置的渠道 endpoint 仍以用户现有值为准。provider-only 初始化会记录 endpoint/API 提示；用户后续修改会报告 conflict，且不会被自动规范化。Provider 官网数据不会自动抓取，也不会被当作 models.dev provider 记录；任何单独审核过的 provider 事实在通过受支持的 metadata source 提供之前都只是参考。API 凭据应使用引用形式，如 `$OPENAI_API_KEY`、`${OPENAI_API_KEY}`、`!command` 或 `pi-auth:provider`；除非显式传入 `--allow-literal-api-key`，否则字面 API key 不会被持久化。扩展永远不会打印 secret。使用 `--dry-run` 可预览 proposal 而不写入。非交互写入需要 `--yes`；`--dry-run` 优先级高于 `--yes`。`migrate` 接受显式 `--to provider/model`，UI 模式可展示目标候选；非交互模式必须提供 `--to`。
 
 `check` 可离线检查本地文件，网络不可用时使用本地 models.dev 缓存；即使没有 catalog 也会报告本地所有权、元数据和 header findings。slash-command `refresh` 强制读取 catalog 并报告完整配置 findings，不应用修复；它从不写入 `models.json`，普通形式可以更新 catalog/policy 缓存。`refresh --dry-run` 完全只读，也不修改 catalog/policy 缓存。`fix` 只修改 Pi Model Doctor 拥有的字段。如果用户显式修改过 endpoint、header、compat 对象或模型能力，会报告为 conflict 且不会覆盖。`remove` 需要精确的 `provider/model` 目标。`migrate` 从当前元数据创建目标模型，保留安全用户字段，报告 endpoint/API/header 冲突但不复制 secret，默认保留源模型，显式 `--remove-source` 才会删除源；deprecated 目标仅作提示，不能自动应用。无操作的迁移报告无变更且不创建备份。每次修改都会验证 proposal 创建后 `models.json` 是否变化，然后使用备份、原子写入、持久化后 read-back 验证；持久化验证失败会自动恢复。当活动 Pi runtime 使用默认 agent models 路径时，命令会刷新并验证模型注册表，报告 `persisted-and-active`、`activation-failed` 或 `persisted-reload-required`；dry-run 和取消报告 `not-persisted`。备份清理是显式操作：`/model-doctor cleanup-backups --keep <count>` 或 `--max-age-ms <milliseconds>` 在授权后预览/删除旧的时间戳备份；从不自动运行。
 
@@ -120,7 +121,7 @@ Pi 会以项目的 `.pi/` 目录作为 `.pi/settings.json` 相对路径的基准
 ~/.pi/model-doctor/policies-cache.json
 ```
 
-`policies-cache.json` 包含 reasoning/cache resolver 使用的版本化能力策略目录。其 baseline 记录 Pi runtime 版本（`0.82.1`）、models.dev schema 标签（`api.json`）、归一化 schema 版本（`1`）、观测日期、PolicyCatalog schema 版本和 `_piModelDoctor` 元数据版本。无效、不兼容、敏感或权限不安全的数据会被忽略并重新生成。`models-cache.json` 保存归一化完整 catalog；`providers-cache.json` 保存 provider 摘要、环境变量名、所选 adapter、reasoning 控制方式和独立的 prompt/context/KV 能力信号。缓存写入拒绝敏感字段；缓存目录 mode 为 `0700`，缓存文件 mode 为 `0600`。能力结果包含 resolved、partial、advisory 或 unsupported 状态；价格元数据不视为启用运行时缓存的授权。每个结果都保留来源和置信度，避免把 provider 事实误认为已验证的 Pi runtime 行为。
+`policies-cache.json` 包含 reasoning/cache resolver 使用的版本化能力策略目录。其 baseline 记录 Pi 兼容性基线（`0.82.1`）、models.dev schema 标签（`api.json`）、归一化 schema 版本（`1`）、观测日期、PolicyCatalog schema 版本和 `_piModelDoctor` 元数据版本。无效、不兼容、敏感或权限不安全的数据会被忽略并重新生成。`models-cache.json` 保存归一化完整 catalog；`providers-cache.json` 保存 provider 摘要、环境变量名、所选 adapter、reasoning 控制方式和独立的 prompt/context/KV 能力信号。缓存写入拒绝敏感字段；缓存目录 mode 为 `0700`，缓存文件 mode 为 `0600`。能力结果包含 resolved、partial、advisory 或 unsupported 状态；价格元数据不视为启用运行时缓存的授权。每个结果都保留来源和置信度，避免把 provider 事实误认为已验证的 Pi runtime 行为。
 
 可用 `PI_MODEL_DOCTOR_DIR` 覆盖位置；用 `PI_MODEL_DOCTOR_MODELS_PATH` 覆盖配置目标；用 `PI_MODEL_DOCTOR_MODELS_DEV_URL` 覆盖 models.dev endpoint。自定义 endpoint 必须通过相同的 HTTPS/私网策略；显式信任的私有测试基础设施需要 `PI_MODEL_DOCTOR_TRUSTED_ENDPOINT=1`。刷新是本地优先、故障安全的：网络刷新失败时保留有效旧缓存并报告其已过期。会话级后台刷新默认每 24 小时运行一次，带有限随机抖动以减少多会话刷新风暴；设置 `PI_MODEL_DOCTOR_REFRESH_INTERVAL_MS=0` 可禁用。`PI_MODEL_DOCTOR_REFRESH_JITTER_MS` 可覆盖抖动上限。后台刷新只更新 catalog 缓存并报告 warning；从不修改 `models.json`。
 
@@ -138,6 +139,8 @@ npm run typecheck
 npm test
 npm pack --dry-run
 ```
+
+本仓库不会把 `@earendil-works/pi-coding-agent` 安装或固定在 `devDependencies` 中，而是将 Pi 声明为可选的宿主 peer。开发脚本会解析机器上已经安装的 Pi，并使用该版本执行类型检查和测试；如果无法自动找到 Pi，可设置 `PI_HOST_PACKAGE` 为已安装的 `@earendil-works/pi-coding-agent` 包目录。这样本地检查使用的就是实际加载扩展的 Pi 版本，开发辅助脚本也不会进入发布包。
 
 安装到其他 Pi 项目：
 

@@ -26,7 +26,9 @@ import {
   defaultPolicyCatalog,
   detectChannelApi,
   detectPiApi,
+  endpointApiForModel,
   inferProviderEndpoint,
+  normalizeEndpointForApi,
   isPolicyCatalog,
   resolveCache,
   resolveProviderAdapter,
@@ -278,8 +280,8 @@ export class ModelDoctor {
     if (input.providerId !== undefined && (!requestedProviderId || isUnsafeIdentifier(requestedProviderId) || /[\\/]/.test(requestedProviderId))) {
       throw new DoctorError("Explicit provider id must be a safe non-empty identifier", "invalid-target");
     }
-    if (requestedProviderId && (!looksLikeUrl(target) || requestedModelId)) {
-      throw new DoctorError("Explicit provider id is only supported for provider-only endpoint setup", "invalid-target");
+    if (requestedProviderId && !looksLikeUrl(target)) {
+      throw new DoctorError("Explicit provider id requires a provider endpoint URL", "invalid-target");
     }
     const requestedMetadataProvider = input.metadataProvider?.trim();
     if (input.metadataProvider !== undefined && (!requestedMetadataProvider || isUnsafeIdentifier(requestedMetadataProvider))) throw new DoctorError("Metadata provider must be a safe non-empty identifier", "invalid-target");
@@ -303,7 +305,13 @@ export class ModelDoctor {
     const configuredProviders = getProviders(data);
     const configuredByTarget = findConfiguredProvider(configuredProviders, target);
     const configuredByExplicitId = requestedProviderId ? findConfiguredProviderById(configuredProviders, requestedProviderId) : undefined;
-    const configuredEntry = configuredByExplicitId ?? configuredByTarget;
+    if (requestedProviderId && configuredByTarget && configuredByTarget.id !== configuredByExplicitId?.id) {
+      throw new DoctorError(`Endpoint ${target} is already configured as provider ${configuredByTarget.id}; choose a different provider id or reuse that provider`, "invalid-target");
+    }
+    if (requestedProviderId && configuredByExplicitId?.provider.baseUrl && !sameChannelEndpoint(configuredByExplicitId.provider.baseUrl, target, configuredByExplicitId.provider.api)) {
+      throw new DoctorError(`Provider ${requestedProviderId} is already configured with a different endpoint; use its existing endpoint or choose a different provider id`, "invalid-target");
+    }
+    const configuredEntry = configuredByExplicitId ?? (requestedProviderId ? undefined : configuredByTarget);
     const match = catalog ? chooseMatch(catalog, target, requestedModelId, requestedMetadataProvider, Boolean(configuredEntry || looksLikeUrl(target))) : undefined;
     if (match?.ambiguous || match?.matchedBy.includes("model-ambiguous")) {
       throw new DoctorError(`Model selection for ${target}${requestedModelId ? `/${requestedModelId}` : ""} is ambiguous; choose an exact model id`, "selection-required");
@@ -365,7 +373,10 @@ export class ModelDoctor {
       const catalogMatch = match?.provider !== undefined && requestedProviderId === undefined;
       const pid = requestedProviderId
         ?? providerIdForAddTarget(target, undefined, configuredProviders, provider?.id ?? providerName, !catalogMatch, catalog ? Object.keys(catalog.providers) : []);
-      const plan = mergeProvider(next, pid, configuredProvider, this.now(), { preserveProviderIdentity: true });
+      const plan = mergeProvider(next, pid, configuredProvider, this.now(), {
+        preserveProviderIdentity: true,
+        endpointApiExplicit: input.api !== undefined,
+      });
       let proposalConfig = next;
       if (jsonEqual(stripDoctorMetadata(data), stripDoctorMetadata(next))) {
         plan.changes = [];
@@ -401,9 +412,10 @@ export class ModelDoctor {
         .join(" ");
     }
     const policy = await this.getPolicyCatalog(input.persistCache !== false && !input.dryRun);
-    const metadataOnly = match?.metadataOnly === true;
-    const transportOwned = metadataOnly || looksLikeUrl(target);
-    const providerId = providerIdForAddTarget(
+    const metadataOnly = requestedProviderId !== undefined || match?.metadataOnly === true;
+    const provisionalProviderOnly = isProvisionalProviderOnly(configuredEntry?.provider);
+    const transportOwned = metadataOnly || looksLikeUrl(target) || provisionalProviderOnly;
+    const providerId = requestedProviderId ?? providerIdForAddTarget(
       target,
       configuredEntry,
       configuredProviders,
@@ -414,22 +426,56 @@ export class ModelDoctor {
     const modelId = sourceModel.id;
     const requestedEndpoint = looksLikeUrl(target)
       ? target
-      : metadataOnly
+      : (provisionalProviderOnly || metadataOnly)
         ? configuredEntry?.provider.baseUrl
         : undefined;
-    const endpoint = inferProviderEndpoint(provider, requestedEndpoint);
-    if (!endpoint && !findConfiguredProviderById(getProviders(data), providerId)) {
+    const inferredEndpoint = inferProviderEndpoint(provider, requestedEndpoint);
+    if (!inferredEndpoint && !findConfiguredProviderById(getProviders(data), providerId)) {
       throw new DoctorError(`Unable to infer an API endpoint for provider ${providerId}; pass a provider URL to add`, "invalid-target");
     }
-    const configuredChannelApi = isPiApi(configuredEntry?.provider.api) ? configuredEntry.provider.api : undefined;
-    const channelApi = input.api ?? ((metadataOnly || looksLikeUrl(target))
-      ? detectChannelApi(endpoint, configuredChannelApi)
-      : detectPiApi(provider, endpoint));
+    const pendingMetadata = provisionalProviderOnly ? configuredEntry?.provider._piModelDoctor : undefined;
+    const pendingEndpointAutoRepair = provisionalProviderOnly && configuredEntry?.provider !== undefined
+      ? isPendingEndpointAutoRepair(configuredEntry.provider)
+      : false;
+    const pendingApiAutoRepair = provisionalProviderOnly && configuredEntry?.provider !== undefined
+      ? isPendingApiAutoRepair(configuredEntry.provider)
+      : false;
+    const pendingApiChanged = provisionalProviderOnly && configuredEntry?.provider !== undefined
+      ? isPendingApiChanged(configuredEntry.provider)
+      : false;
+    const configuredChannelApi = configuredEntry && isPiApi(configuredEntry.provider.api)
+      && (!provisionalProviderOnly || pendingMetadata?.endpointApiExplicit === true || pendingApiChanged)
+      ? configuredEntry.provider.api
+      : undefined;
+    // While a provider-only channel is pending, resolve the API family from
+    // the selected model/provider metadata rather than locking in the URL's
+    // initial heuristic. Explicit --api or a later user edit remains owned by
+    // the channel and takes precedence.
+    const modelApi = endpointApiForModel(provider, provisionalProviderOnly ? undefined : inferredEndpoint, input.api ?? configuredChannelApi);
+    const inferredChannelApi = provisionalProviderOnly && modelApi
+      ? modelApi
+      : (metadataOnly || looksLikeUrl(target))
+        ? detectChannelApi(inferredEndpoint)
+        : detectPiApi(provider, inferredEndpoint);
+    const channelApi = input.api ?? configuredChannelApi ?? inferredChannelApi;
+    // A direct channel URL can be a bare host while its resolved metadata tells
+    // us that the model speaks an API family with a conventional version path.
+    // Only root URLs are normalized; existing paths remain channel-owned.
+    const endpointApi = provisionalProviderOnly
+      ? (input.api ?? configuredChannelApi ?? modelApi)
+      : endpointApiForModel(provider, inferredEndpoint, input.api ?? configuredChannelApi);
+    const endpoint = transportOwned && (configuredEntry === undefined || provisionalProviderOnly)
+      && (!provisionalProviderOnly || pendingEndpointAutoRepair)
+      ? normalizeEndpointForApi(inferredEndpoint, endpointApi)
+      : inferredEndpoint;
+    const normalizeConfiguredEndpoint = provisionalProviderOnly
+      && pendingEndpointAutoRepair
+      && isAutoEndpointNormalization(inferredEndpoint, endpoint, endpointApi);
     const generatedModel = toPiModel(provider, sourceModel, {
       endpoint,
       api: channelApi,
       providerId,
-      adapterProviderId: transportOwned ? adapterIdForPiApi(channelApi) : undefined,
+      adapterProviderId: transportOwned && isPiApi(channelApi) ? adapterIdForPiApi(channelApi) : undefined,
       metadataOnly,
       transportOwned,
       now: this.now(),
@@ -459,7 +505,20 @@ export class ModelDoctor {
       models: [generatedModel],
     };
     const next = cloneJson(data);
-    const plan = mergeProvider(next, providerId, configuredProvider, this.now(), { preserveProviderIdentity: transportOwned });
+    const plan = mergeProvider(next, providerId, configuredProvider, this.now(), {
+      preserveProviderIdentity: transportOwned,
+      normalizeEndpoint: normalizeConfiguredEndpoint,
+      normalizeApi: provisionalProviderOnly && pendingApiAutoRepair && configuredChannelApi === undefined,
+      endpointApiExplicit: input.api !== undefined || configuredEntry?.provider._piModelDoctor?.endpointApiExplicit === true,
+      endpointNormalizationBlocked: provisionalProviderOnly && configuredEntry?.provider !== undefined && isPendingEndpointChanged(configuredEntry.provider),
+      endpointApiNormalizationBlocked: provisionalProviderOnly && pendingApiChanged,
+    });
+    if (provisionalProviderOnly && configuredEntry?.provider && isPendingEndpointChanged(configuredEntry.provider)) {
+      plan.conflicts.push(finding("endpoint-mismatch", "warning", `${providerId}/${modelId}`, "Provider-only endpoint was changed after setup; the user-owned endpoint was preserved", false, true));
+    }
+    if (provisionalProviderOnly && pendingApiChanged) {
+      plan.conflicts.push(finding("api-mismatch", "warning", `${providerId}/${modelId}`, "Provider-only API protocol was changed after setup; the user-owned API was preserved", false, true));
+    }
     let proposalConfig = next;
     if (jsonEqual(stripDoctorMetadata(data), stripDoctorMetadata(next))) {
       plan.changes = [];
@@ -469,7 +528,7 @@ export class ModelDoctor {
     const normalizedReasoning = resolveReasoning(provider, sourceModel);
     const normalizedCache = resolveCache(provider, sourceModel, catalogSource === "fallback" ? "fallback" : "models.dev");
     const adapter = metadataOnly || looksLikeUrl(target)
-      ? resolveProviderAdapter({ id: adapterIdForPiApi(channelApi), models: {} }, endpoint, channelApi)
+      ? resolveProviderAdapter({ id: isPiApi(channelApi) ? adapterIdForPiApi(channelApi) : provider.id, models: {} }, endpoint, isPiApi(channelApi) ? channelApi : undefined)
       : resolveProviderAdapter(provider, endpoint, channelApi);
     if (metadataOnly) {
       warning = [warning, `Third-party channel ${providerId} is not a models.dev provider; using ${provider.id}/${sourceModel.id} as metadata only. Endpoint, protocol, headers, and authentication remain channel-owned.`]
@@ -581,7 +640,29 @@ export class ModelDoctor {
       const syncProvider = cloneJson(addProvider);
       syncProvider.models = [cloneJson(desiredModel)];
       const preserveProviderIdentity = desiredModel.compat?.transportOwned === true || add.metadataOnly === true;
-      const mergePlan = mergeProvider(config, add.providerId, syncProvider, this.now(), { preserveProviderIdentity });
+      const existingSyncProvider = getProviders(config)[add.providerId];
+      if (existingSyncProvider && preserveProviderIdentity && getModels(existingSyncProvider).length > 0
+        && isPiApi(existingSyncProvider.api) && isPiApi(syncProvider.api)
+        && existingSyncProvider.api !== syncProvider.api) {
+        throw new DoctorError(`Sync selected models require different channel API protocols (${existingSyncProvider.api} and ${syncProvider.api}); split the sync or pass an explicit --api`, "invalid-target");
+      }
+      const providerPrefix = `providers.${add.providerId}`;
+      const normalizeEndpoint = add.plan.changes.some((change) => change.path === `${providerPrefix}.baseUrl` && change.ownership === "managed");
+      const normalizeApi = add.plan.changes.some((change) => change.path === `${providerPrefix}.api` && change.ownership === "managed");
+      const endpointNormalizationBlocked = existingSyncProvider !== undefined
+        && (isPendingEndpointChanged(existingSyncProvider)
+          || add.plan.conflicts.some((finding) => finding.code === "endpoint-mismatch" && finding.userOwned === true));
+      const endpointApiNormalizationBlocked = existingSyncProvider !== undefined
+        && (isPendingApiChanged(existingSyncProvider)
+          || add.plan.conflicts.some((finding) => finding.code === "api-mismatch" && finding.userOwned === true));
+      const mergePlan = mergeProvider(config, add.providerId, syncProvider, this.now(), {
+        preserveProviderIdentity,
+        normalizeEndpoint,
+        normalizeApi,
+        endpointApiExplicit: input.api !== undefined || existingSyncProvider?._piModelDoctor?.endpointApiExplicit === true,
+        endpointNormalizationBlocked,
+        endpointApiNormalizationBlocked,
+      });
       plans.push({
         ...mergePlan,
         conflicts: [...mergePlan.conflicts, ...add.plan.conflicts],
@@ -949,7 +1030,7 @@ export class ModelDoctor {
   }
 }
 
-function mergeProvider(config: PiModelsJson, providerId: string, desired: PiProvider, now: Date, options: { preserveProviderIdentity?: boolean } = {}): ChangePlan {
+function mergeProvider(config: PiModelsJson, providerId: string, desired: PiProvider, now: Date, options: { preserveProviderIdentity?: boolean; normalizeEndpoint?: boolean; normalizeApi?: boolean; endpointApiExplicit?: boolean; endpointNormalizationBlocked?: boolean; endpointApiNormalizationBlocked?: boolean } = {}): ChangePlan {
   if (isUnsafeIdentifier(providerId)) throw new DoctorError("Provider id uses an unsafe identifier", "invalid-target");
   const providers = getProviders(config);
   const existingEntry = findConfiguredProvider(providers, providerId);
@@ -964,6 +1045,12 @@ function mergeProvider(config: PiModelsJson, providerId: string, desired: PiProv
       lastCheck: now.toISOString(),
       autoRepair: true,
       providerId: storageId,
+      endpointNormalizationPending: getModels(desired).length === 0,
+      endpointApiExplicit: options.endpointApiExplicit === true,
+      endpointApiHint: getModels(desired).length === 0 && isPiApi(desired.api) ? desired.api : undefined,
+      endpointValueHint: getModels(desired).length === 0 && typeof desired.baseUrl === "string" ? desired.baseUrl : undefined,
+      endpointNormalizationBlocked: options.endpointNormalizationBlocked === true,
+      endpointApiNormalizationBlocked: options.endpointApiNormalizationBlocked === true,
     }, providerManagedFields, Object.fromEntries(providerManagedFields.map((field) => [field, desired[field]]).filter(([, value]) => value !== undefined)));
     providers[storageId] = desired;
     changes.push({ path: `providers.${storageId}`, before: undefined, after: desired, reason: "Add provider from models.dev", ownership: "managed" });
@@ -972,7 +1059,7 @@ function mergeProvider(config: PiModelsJson, providerId: string, desired: PiProv
   const provider = existing;
   const providerManagedFields: string[] = [];
   for (const field of ["name", "baseUrl", "api"] as const) {
-    if (options.preserveProviderIdentity) continue;
+    if (options.preserveProviderIdentity && !((field === "baseUrl" && options.normalizeEndpoint) || (field === "api" && options.normalizeApi))) continue;
     const value = desired[field];
     if (value === undefined) continue;
     if (canManageField(provider, field)) {
@@ -982,7 +1069,14 @@ function mergeProvider(config: PiModelsJson, providerId: string, desired: PiProv
         provider[field] = value;
       }
     } else if (!jsonEqual(provider[field], value)) {
-      conflicts.push(finding(field === "baseUrl" ? "endpoint-mismatch" : "api-mismatch", "warning", storageId, `Preserved user-owned provider ${field}`, false, true));
+      const endpointNormalization = field === "baseUrl" && options.normalizeEndpoint === true;
+      const apiNormalization = field === "api" && options.normalizeApi === true;
+      if (endpointNormalization || apiNormalization) {
+        changes.push({ path: `providers.${storageId}.${field}`, before: provider[field], after: value, reason: endpointNormalization ? "Normalize channel endpoint for resolved model API" : "Normalize channel API for resolved model metadata", ownership: "managed" });
+        provider[field] = value;
+      } else {
+        conflicts.push(finding(field === "baseUrl" ? "endpoint-mismatch" : "api-mismatch", "warning", storageId, `Preserved user-owned provider ${field}`, false, true));
+      }
     }
   }
   if (desired.apiKey !== undefined && provider.apiKey === undefined) {
@@ -1000,7 +1094,22 @@ function mergeProvider(config: PiModelsJson, providerId: string, desired: PiProv
   }
   const previousProviderMetadata = hasDoctorMetadata(provider) ? provider._piModelDoctor : undefined;
   if (previousProviderMetadata || providerManagedFields.length > 0) {
-    let nextProviderMetadata = buildMetadata(previousProviderMetadata, { source: "models.dev", lastCheck: now.toISOString(), autoRepair: true, providerId: storageId }, providerManagedFields, Object.fromEntries(providerManagedFields.map((field) => [field, provider[field]]).filter(([, value]) => value !== undefined)));
+    let nextProviderMetadata = buildMetadata(previousProviderMetadata, {
+      source: "models.dev",
+      lastCheck: now.toISOString(),
+      autoRepair: true,
+      providerId: storageId,
+      endpointNormalizationPending: false,
+      endpointApiExplicit: options.endpointApiExplicit ?? previousProviderMetadata?.endpointApiExplicit ?? false,
+      endpointApiHint: options.endpointApiNormalizationBlocked === true || previousProviderMetadata?.endpointApiNormalizationBlocked === true
+        ? previousProviderMetadata?.endpointApiHint
+        : undefined,
+      endpointValueHint: options.endpointNormalizationBlocked === true || previousProviderMetadata?.endpointNormalizationBlocked === true
+        ? previousProviderMetadata?.endpointValueHint
+        : undefined,
+      endpointNormalizationBlocked: options.endpointNormalizationBlocked ?? previousProviderMetadata?.endpointNormalizationBlocked ?? false,
+      endpointApiNormalizationBlocked: options.endpointApiNormalizationBlocked ?? previousProviderMetadata?.endpointApiNormalizationBlocked ?? false,
+    }, providerManagedFields, Object.fromEntries(providerManagedFields.map((field) => [field, provider[field]]).filter(([, value]) => value !== undefined)));
     if (options.preserveProviderIdentity) nextProviderMetadata = withoutManagedFields(nextProviderMetadata, ["name", "baseUrl", "api"]);
     if (!jsonEqual(previousProviderMetadata, nextProviderMetadata)) {
       provider._piModelDoctor = nextProviderMetadata;
@@ -1021,6 +1130,46 @@ function withoutManagedFields(metadata: DoctorMetadata, fields: string[]): Docto
     managedFields,
     ...(managedValues ? { managedValues } : {}),
   };
+}
+
+function isProvisionalProviderOnly(provider: PiProvider | undefined): boolean {
+  return provider?._piModelDoctor?.endpointNormalizationPending === true && getModels(provider).length === 0;
+}
+
+function isPendingEndpointAutoRepair(provider: PiProvider): boolean {
+  const metadata = provider._piModelDoctor;
+  if (metadata?.endpointNormalizationPending !== true || typeof metadata.endpointValueHint !== "string") return false;
+  if (isPendingEndpointChanged(provider) || isPendingApiChanged(provider)) return false;
+  return typeof provider.baseUrl === "string" && provider.baseUrl === metadata.endpointValueHint;
+}
+
+function isPendingApiAutoRepair(provider: PiProvider, model?: PiModel): boolean {
+  const metadata = provider._piModelDoctor;
+  if (metadata?.endpointNormalizationPending !== true || metadata.endpointApiExplicit === true || !isPiApi(metadata.endpointApiHint)) return false;
+  if (isPendingApiChanged(provider)) return false;
+  if (!isPiApi(provider.api) || provider.api !== metadata.endpointApiHint) return false;
+  if (model && isPiApi(model.api) && (!hasDoctorMetadata(model) || model._piModelDoctor.managedFields?.includes("api") !== true)) return false;
+  return true;
+}
+
+function isPendingEndpointChanged(provider: PiProvider): boolean {
+  const metadata = provider._piModelDoctor;
+  return (metadata?.endpointNormalizationPending === true || metadata?.endpointNormalizationBlocked === true)
+    && typeof metadata.endpointValueHint === "string"
+    && provider.baseUrl !== metadata.endpointValueHint;
+}
+
+function isPendingApiChanged(provider: PiProvider): boolean {
+  const metadata = provider._piModelDoctor;
+  return (metadata?.endpointNormalizationPending === true || metadata?.endpointApiNormalizationBlocked === true)
+    && isPiApi(metadata.endpointApiHint)
+    && provider.api !== metadata.endpointApiHint;
+}
+
+function isAutoEndpointNormalization(inferred: string | undefined, normalized: string | undefined, api: PiApi | undefined): boolean {
+  if (!inferred || !normalized || inferred === normalized) return false;
+  if (api !== "openai-completions" && api !== "openai-responses") return false;
+  return normalizeEndpointIdentity(withoutOpenAiVersionPath(inferred)) === normalizeEndpointIdentity(withoutOpenAiVersionPath(normalized));
 }
 
 function mismatchCode(field: string): FindingCode {
@@ -1090,14 +1239,24 @@ function applyRepairPlan(config: PiModelsJson, target: string, catalog: ModelsDe
     return { target, changes: [], conflicts: findings.filter((item) => item.code === "deprecated-model" || !item.repairable), warnings: ["Deprecated models are never automatically repaired."] };
   }
   const metadataOnly = match.metadataOnly === true;
-  const transportOwned = metadataOnly || model.compat?.transportOwned === true;
-  const desiredEndpoint = inferProviderEndpoint(match.provider);
+  const pendingEndpointAutoRepair = isPendingEndpointAutoRepair(provider);
+  const pendingApiAutoRepair = isPendingApiAutoRepair(provider, model);
+  const pendingEndpointChanged = isPendingEndpointChanged(provider);
+  const pendingApiChanged = isPendingApiChanged(provider);
+  const transportOwned = metadataOnly || model.compat?.transportOwned === true || provider._piModelDoctor?.endpointNormalizationPending === true;
+  const catalogEndpoint = inferProviderEndpoint(match.provider);
   const channelEndpoint = model.baseUrl ?? provider.baseUrl;
   const channelApi = transportOwned
-    ? detectConfiguredChannelApi(provider, model, channelEndpoint)
-    : detectPiApi(match.provider, provider.baseUrl ?? desiredEndpoint);
+    ? detectConfiguredChannelApi(provider, model, channelEndpoint, match.provider)
+    : detectPiApi(match.provider, provider.baseUrl ?? catalogEndpoint);
+  const endpointApi = endpointApiForModel(match.provider, channelEndpoint, channelApi);
+  const desiredEndpoint = transportOwned && pendingEndpointAutoRepair
+    ? normalizeEndpointForApi(channelEndpoint, endpointApi)
+    : transportOwned
+      ? channelEndpoint
+      : catalogEndpoint;
   const desired = toPiModel(match.provider, match.model, {
-    endpoint: transportOwned ? channelEndpoint : provider.baseUrl ?? desiredEndpoint,
+    endpoint: transportOwned ? desiredEndpoint : provider.baseUrl ?? desiredEndpoint,
     api: channelApi,
     providerId,
     adapterProviderId: transportOwned ? adapterIdForPiApi(channelApi) : undefined,
@@ -1110,6 +1269,10 @@ function applyRepairPlan(config: PiModelsJson, target: string, catalog: ModelsDe
   const changes: Change[] = [];
   const conflicts = findings.filter((item) => item.userOwned && !item.repairable);
   const providerMetadataBefore = hasDoctorMetadata(provider) ? cloneJson(provider._piModelDoctor) : undefined;
+  const autoEndpointRepair = transportOwned
+    && pendingEndpointAutoRepair
+    && isAutoEndpointNormalization(channelEndpoint, desiredEndpoint, endpointApi);
+  const autoApiRepair = pendingApiAutoRepair && provider.api !== channelApi;
   const modelMetadataBefore = hasDoctorMetadata(model) ? cloneJson(model._piModelDoctor) : undefined;
   const providerChangedFields = new Set<string>();
   const modelChangedFields = new Set<string>();
@@ -1148,7 +1311,14 @@ function applyRepairPlan(config: PiModelsJson, target: string, catalog: ModelsDe
       conflicts.push(finding(field === "contextWindow" ? "context-window-mismatch" : field === "maxTokens" ? "max-tokens-mismatch" : mismatchCode(field), "warning", target, `User-owned ${field} differs from models.dev; not overwritten`, false, true));
     }
   }
-  if (!transportOwned && canManageField(provider, "baseUrl")) {
+  if (transportOwned && pendingEndpointChanged && !conflicts.some((item) => item.code === "endpoint-mismatch" && item.userOwned === true)) {
+    conflicts.push(finding("endpoint-mismatch", "warning", target, "Provider-only endpoint was changed after setup; the user-owned endpoint was preserved", false, true));
+  }
+  if (transportOwned && autoEndpointRepair && provider.baseUrl !== desiredEndpoint) {
+    changes.push({ path: `providers.${providerId}.baseUrl`, before: provider.baseUrl, after: desiredEndpoint, reason: "Normalize provider-only endpoint for resolved model API", ownership: "managed" });
+    provider.baseUrl = desiredEndpoint;
+    providerChangedFields.add("baseUrl");
+  } else if (!transportOwned && canManageField(provider, "baseUrl")) {
     if (desiredEndpoint && provider.baseUrl !== desiredEndpoint) {
       changes.push({ path: `providers.${providerId}.baseUrl`, before: provider.baseUrl, after: desiredEndpoint, reason: "Repair provider endpoint", ownership: "managed" });
       provider.baseUrl = desiredEndpoint;
@@ -1157,7 +1327,11 @@ function applyRepairPlan(config: PiModelsJson, target: string, catalog: ModelsDe
   } else if (!transportOwned && desiredEndpoint && provider.baseUrl !== desiredEndpoint) {
     conflicts.push(finding("endpoint-mismatch", "warning", target, "User-owned endpoint differs from models.dev; not overwritten", false, true));
   }
-  if (!transportOwned && canManageField(provider, "api")) {
+  if (pendingApiAutoRepair && autoApiRepair) {
+    changes.push({ path: `providers.${providerId}.api`, before: provider.api, after: channelApi, reason: "Normalize channel API for resolved model metadata", ownership: "managed" });
+    provider.api = channelApi;
+    providerChangedFields.add("api");
+  } else if (!transportOwned && canManageField(provider, "api")) {
     const expectedApi = detectPiApi(match.provider, provider.baseUrl ?? desiredEndpoint);
     if (provider.api !== expectedApi) {
       changes.push({ path: `providers.${providerId}.api`, before: provider.api, after: expectedApi, reason: "Repair API protocol", ownership: "managed" });
@@ -1171,6 +1345,8 @@ function applyRepairPlan(config: PiModelsJson, target: string, catalog: ModelsDe
     for (const field of ["name", "baseUrl", "api"]) providerManagedFields.delete(field);
   }
   const providerMetadataNeedsUpdate = providerChangedFields.size > 0
+    || autoEndpointRepair
+    || providerMetadataBefore?.endpointNormalizationPending === true
     || transportOwned && ["name", "baseUrl", "api"].some((field) => providerMetadataBefore?.managedFields?.includes(field));
   if (providerMetadataNeedsUpdate) {
     let providerMetadataAfter = buildMetadata(providerMetadataBefore, {
@@ -1178,6 +1354,11 @@ function applyRepairPlan(config: PiModelsJson, target: string, catalog: ModelsDe
       lastCheck: now.toISOString(),
       autoRepair: true,
       providerId,
+      endpointNormalizationPending: false,
+      endpointApiExplicit: providerMetadataBefore?.endpointApiExplicit ?? false,
+      endpointValueHint: pendingEndpointChanged || providerMetadataBefore?.endpointNormalizationBlocked === true ? providerMetadataBefore?.endpointValueHint : undefined,
+      endpointNormalizationBlocked: pendingEndpointChanged || providerMetadataBefore?.endpointNormalizationBlocked === true,
+      endpointApiNormalizationBlocked: pendingApiChanged || providerMetadataBefore?.endpointApiNormalizationBlocked === true,
     }, [...providerManagedFields], managedSnapshotValues(provider, providerManagedFields, providerMetadataBefore, providerChangedFields));
     if (transportOwned) providerMetadataAfter = withoutManagedFields(providerMetadataAfter, ["name", "baseUrl", "api"]);
     if (!jsonEqual(providerMetadataBefore, providerMetadataAfter)) {
@@ -1245,28 +1426,53 @@ function checkModel(providerId: string, provider: PiProvider, model: PiModel, so
     findings.push(finding("missing-model", "warning", target, `No models.dev metadata found for ${target}`, false));
     return findings;
   }
-  const transportOwned = metadataOnly || model.compat?.transportOwned === true;
+  const pendingEndpointAutoRepair = isPendingEndpointAutoRepair(provider);
+  const pendingApiAutoRepair = isPendingApiAutoRepair(provider, model);
+  const pendingEndpointChanged = isPendingEndpointChanged(provider);
+  const pendingApiChanged = isPendingApiChanged(provider);
+  const transportOwned = metadataOnly || model.compat?.transportOwned === true || provider._piModelDoctor?.endpointNormalizationPending === true;
   const expectedEndpoint = inferProviderEndpoint(sourceProvider);
   const effectiveEndpoint = provider.baseUrl ?? expectedEndpoint;
   const channelEndpoint = model.baseUrl ?? effectiveEndpoint;
   const expectedApi = transportOwned
-    ? detectConfiguredChannelApi(provider, model, channelEndpoint)
+    ? detectConfiguredChannelApi(provider, model, channelEndpoint, sourceProvider)
     : detectPiApi(sourceProvider, effectiveEndpoint);
+  const endpointApi = endpointApiForModel(sourceProvider, channelEndpoint, expectedApi);
+  const normalizedChannelEndpoint = transportOwned && pendingEndpointAutoRepair
+    ? normalizeEndpointForApi(channelEndpoint, endpointApi)
+    : channelEndpoint;
+  const endpointNormalizationPending = transportOwned
+    && pendingEndpointAutoRepair
+    && isAutoEndpointNormalization(channelEndpoint, normalizedChannelEndpoint, endpointApi);
   const expectedModel = toPiModel(sourceProvider, sourceModel, {
-    endpoint: transportOwned ? channelEndpoint : effectiveEndpoint,
+    endpoint: transportOwned ? normalizedChannelEndpoint : effectiveEndpoint,
     api: expectedApi,
     adapterProviderId: transportOwned ? adapterIdForPiApi(expectedApi) : undefined,
     metadataOnly,
     transportOwned,
     policy,
   });
-  if (!transportOwned && provider.api !== expectedApi) {
-    findings.push(finding("api-mismatch", "warning", target, `Configured provider API is ${provider.api ?? "unset"}; expected ${expectedApi}`, provider.api === undefined || canManageField(provider, "api"), provider.api !== undefined && !canManageField(provider, "api")));
+  const transportApiMismatch = transportOwned
+    && isPiApi(provider.api)
+    && isPiApi(expectedApi)
+    && provider.api !== expectedApi;
+  if ((!transportOwned || transportApiMismatch) && provider.api !== expectedApi) {
+    const repairable = pendingApiAutoRepair || !transportOwned && (provider.api === undefined || canManageField(provider, "api"));
+    findings.push(finding("api-mismatch", "warning", target, `Configured provider API is ${provider.api ?? "unset"}; expected ${expectedApi}`, repairable, !repairable && transportOwned));
   }
   if (!transportOwned && expectedEndpoint && provider.baseUrl !== expectedEndpoint) {
     findings.push(finding("endpoint-mismatch", "warning", target, `Configured endpoint is ${provider.baseUrl ?? "unset"}; models.dev expects ${expectedEndpoint}`, provider.baseUrl === undefined || canManageField(provider, "baseUrl"), provider.baseUrl !== undefined && !canManageField(provider, "baseUrl")));
   } else if (metadataOnly) {
     findings.push(finding("third-party-channel", "info", target, `Using ${sourceProvider.id}/${sourceModel.id} from models.dev as model metadata only; the configured channel endpoint, protocol, headers, and authentication are authoritative`, false));
+  }
+  if (pendingEndpointChanged) {
+    findings.push(finding("endpoint-mismatch", "warning", target, "Provider-only endpoint was changed after setup; the user-owned endpoint was preserved", false, true));
+  }
+  if (pendingApiChanged || provider._piModelDoctor?.endpointApiNormalizationBlocked === true) {
+    findings.push(finding("api-mismatch", "warning", target, "Provider-only API protocol was changed after setup; the user-owned API was preserved", false, true));
+  }
+  if (endpointNormalizationPending) {
+    findings.push(finding("endpoint-mismatch", "warning", target, `Provider-only root endpoint will be normalized to ${normalizedChannelEndpoint} for the resolved ${endpointApi} API`, true));
   }
   if (!transportOwned && model.baseUrl !== undefined && effectiveEndpoint !== undefined && model.baseUrl !== effectiveEndpoint) {
     findings.push(finding("endpoint-mismatch", "warning", target, "Model-specific endpoint override differs from the effective provider endpoint; it was preserved", false, true));
@@ -1550,9 +1756,15 @@ function isPiApi(value: unknown): value is PiApi {
     || value === "google-generative-ai";
 }
 
-function detectConfiguredChannelApi(provider: PiProvider, model: PiModel, endpoint?: string): PiApi {
-  const explicitApi = isPiApi(model.api) ? model.api : isPiApi(provider.api) ? provider.api : undefined;
-  return detectChannelApi(endpoint, explicitApi);
+function detectConfiguredChannelApi(provider: PiProvider, model: PiModel, endpoint?: string, metadataProvider?: ModelsDevProvider): PiApi {
+  const metadata = provider._piModelDoctor;
+  const pendingInference = metadata?.endpointNormalizationPending === true && metadata.endpointApiExplicit !== true;
+  const inferredApiWasUserChanged = pendingInference
+    && isPiApi(provider.api)
+    && metadata?.endpointApiHint !== undefined
+    && provider.api !== metadata.endpointApiHint;
+  const explicitApi = isPiApi(model.api) ? model.api : (pendingInference && !inferredApiWasUserChanged) ? undefined : isPiApi(provider.api) ? provider.api : undefined;
+  return explicitApi ?? endpointApiForModel(metadataProvider, endpoint) ?? detectChannelApi(endpoint);
 }
 
 function isSatisfiedByProviderAuth(header: string, provider: PiProvider): boolean {
@@ -1638,9 +1850,10 @@ function compatCacheDiffers(left: PiModel["compat"], right: PiModel["compat"]): 
 
 function findConfiguredProvider(providers: Record<string, PiProvider>, target: string): { id: string; provider: PiProvider } | undefined {
   const normalized = normalizeIdentifier(target);
-  const entry = Object.entries(providers).find(([id, provider]) => [id, provider.name, provider.baseUrl]
+  const entry = Object.entries(providers).find(([id, provider]) => [id, provider.name]
     .filter((value): value is string => typeof value === "string")
-    .some((value) => normalizeIdentifier(value) === normalized));
+    .some((value) => normalizeIdentifier(value) === normalized)
+    || looksLikeUrl(target) && typeof provider.baseUrl === "string" && sameChannelEndpoint(provider.baseUrl, target, provider.api));
   return entry ? { id: entry[0], provider: entry[1] } : undefined;
 }
 
@@ -1679,7 +1892,7 @@ function providerIdForAddTarget(
   if (metadataOnly) return providerIdFromUrl(target, providers, catalogProviderIds);
 
   const configuredCatalogEntry = findConfiguredProviderById(providers, catalogProviderId);
-  if (!configuredCatalogEntry || normalizeEndpointIdentity(configuredCatalogEntry.provider.baseUrl) === normalizeEndpointIdentity(target)) {
+  if (!configuredCatalogEntry || sameChannelEndpoint(configuredCatalogEntry.provider.baseUrl ?? "", target, configuredCatalogEntry.provider.api)) {
     return catalogProviderId;
   }
   return providerIdFromUrl(target, providers);
@@ -1838,19 +2051,19 @@ function providerIdFromUrl(target: string, providers: Record<string, PiProvider>
     const parsed = new URL(target);
     const hostname = parsed.hostname.replace(/^www\./, "").toLowerCase();
     const base = safeProviderSlug(hostname.split(".")[0] || "custom-provider");
-    const endpoint = normalizeEndpointIdentity(parsed);
-    const existingEndpoint = Object.entries(providers).find(([, provider]) => normalizeEndpointIdentity(provider.baseUrl) === endpoint);
+    const existingEndpoint = Object.entries(providers).find(([, provider]) => typeof provider.baseUrl === "string"
+      && sameChannelEndpoint(provider.baseUrl, target, provider.api));
     if (existingEndpoint) return existingEndpoint[0];
     const reserved = new Set([...Object.keys(providers), ...reservedProviderIds].map((value) => normalizeIdentifier(value)));
     const existingBase = providers[base];
-    if (!reserved.has(base) && (!existingBase || normalizeEndpointIdentity(existingBase.baseUrl) === endpoint)) return base;
+    if (!reserved.has(base) && (!existingBase || typeof existingBase.baseUrl !== "string" || sameChannelEndpoint(existingBase.baseUrl, target, existingBase.api))) return base;
 
     const pathSuffix = parsed.pathname.split("/").filter(Boolean).map(safeProviderSlug).filter(Boolean).join("-");
     const hostSuffix = hostname.split(".").slice(1).map(safeProviderSlug).filter(Boolean).join("-");
     const suffix = pathSuffix || hostSuffix || "channel";
     let candidate = safeProviderSlug(`${base}-${suffix}`);
     let sequence = 2;
-    while (reserved.has(candidate) || providers[candidate] && normalizeEndpointIdentity(providers[candidate].baseUrl) !== endpoint) {
+    while (reserved.has(candidate) || providers[candidate] && (typeof providers[candidate].baseUrl !== "string" || !sameChannelEndpoint(providers[candidate].baseUrl ?? "", target, providers[candidate].api))) {
       candidate = safeProviderSlug(`${base}-${suffix}-${sequence}`);
       sequence += 1;
     }
@@ -1869,9 +2082,29 @@ function normalizeEndpointIdentity(value: string | undefined | URL): string {
   if (!value) return "";
   try {
     const parsed = typeof value === "string" ? new URL(value) : value;
-    return `${parsed.protocol.toLowerCase()}//${parsed.hostname.toLowerCase()}${parsed.port ? `:${parsed.port}` : ""}${parsed.pathname.replace(/\/+$/, "") || "/"}${parsed.search}`;
+    const path = parsed.pathname.replace(/\/+$/, "") || "/";
+    return `${parsed.protocol.toLowerCase()}//${parsed.hostname.toLowerCase()}${parsed.port ? `:${parsed.port}` : ""}${path}${parsed.search}${parsed.hash}`;
   } catch {
     return typeof value === "string" ? value.trim().toLowerCase().replace(/\/+$/, "") : "";
+  }
+}
+
+function sameChannelEndpoint(left: string, right: string, api?: string, normalizedApi?: string): boolean {
+  const leftIdentity = normalizeEndpointIdentity(left);
+  const rightIdentity = normalizeEndpointIdentity(right);
+  if (leftIdentity === rightIdentity) return true;
+  const apiFamily = api ?? normalizedApi;
+  if (apiFamily !== "openai-completions" && apiFamily !== "openai-responses") return false;
+  return withoutOpenAiVersionPath(left) === withoutOpenAiVersionPath(right);
+}
+
+function withoutOpenAiVersionPath(value: string): string {
+  try {
+    const parsed = new URL(value);
+    if (parsed.pathname.replace(/\/+$/u, "") === "/v1") parsed.pathname = "/";
+    return normalizeEndpointIdentity(parsed);
+  } catch {
+    return normalizeEndpointIdentity(value);
   }
 }
 

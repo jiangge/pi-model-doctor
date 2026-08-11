@@ -7,7 +7,8 @@ This contract applies to the root `pi-model-doctor` package because the extensio
 ## 2. Signatures
 
 ```ts
-/model-doctor add <provider-or-url> [model-or-endpoint-url] [--metadata-provider <models.dev-provider>] [--api <protocol>] [--api-key <reference>] [--allow-literal-api-key] [--dry-run] [--yes]
+/model-doctor add <provider-or-url> [model] [--metadata-provider <models.dev-provider>] [--api <protocol>] [--api-key <reference>] [--allow-literal-api-key] [--dry-run] [--yes]
+/model-doctor add <provider-id> <endpoint-url> [model] [--metadata-provider <models.dev-provider>] [--api <protocol>] [--api-key <reference>] [--allow-literal-api-key] [--dry-run] [--yes]
 /model-doctor list [provider]
 /model-doctor check [provider/model]
 /model-doctor fix [provider/model] [--dry-run] [--yes]
@@ -33,16 +34,17 @@ ModelDoctor.applyMigrate(proposal: MigrateProposal): Promise<{ backupPath?: stri
 ModelDoctor.rollback(backupPath: string, options?: { dryRun?: boolean }): Promise<{ sourcePath: string; safetyBackupPath?: string }>
 ```
 
-`AddInput` supports `providerId?: string` for explicit provider-only URL setup (`add providerA https://gateway.example/v1`), `metadataProvider?: string` to disambiguate global models.dev metadata, and `api?: PiApi` to explicitly select a third-party channel transport protocol. `SyncInput` uses `modelIds: string[]` for headless selection and shares the same metadata-provider/API/credential safety rules as `AddInput`.
+`AddInput` supports `providerId?: string` for explicit channel setup (`add providerA https://gateway.example/v1` or `add providerA https://gateway.example/v1 <model>`), `metadataProvider?: string` to disambiguate global models.dev metadata, and `api?: PiApi` to explicitly select a third-party channel transport protocol. `SyncInput` uses `modelIds: string[]` for headless selection and shares the same metadata-provider/API/credential safety rules as `AddInput`.
 
 ## 3. Contracts
 
 - Default target: `join(getAgentDir(), "models.json")`; override with `PI_MODEL_DOCTOR_MODELS_PATH`.
+- The published package does not bundle or pin the Pi host in `devDependencies`; `@earendil-works/pi-coding-agent` and `typebox` remain optional peer dependencies supplied by Pi. Repository development checks resolve the installed Pi host, optionally overridden with `PI_HOST_PACKAGE`.
 - Cache directory: `PI_MODEL_DOCTOR_DIR` or `~/.pi/model-doctor/`.
 - Cache files: `models-cache.json`, `providers-cache.json`, `policies-cache.json`; cache directories are created with mode `0700` and cache files with mode `0600`.
 - models.dev endpoint: `PI_MODEL_DOCTOR_MODELS_DEV_URL` or `https://models.dev/api.json`. Custom endpoints use the same HTTPS/private-host policy; explicitly trusted private test infrastructure requires `PI_MODEL_DOCTOR_TRUSTED_ENDPOINT=1`.
 - Mutating commands read JSON, create `models.json.bak-<timestamp>[-n]`, verify the proposal base fingerprint before writing, and atomically rename a temp file into place.
-- `_piModelDoctor` is extension-owned metadata with `managed`, `source`, `lastCheck`, `autoRepair`, `version`, `managedFields`, and `managedValues`.
+- `_piModelDoctor` is extension-owned metadata with `managed`, `source`, `lastCheck`, `autoRepair`, `version`, `managedFields`, and `managedValues`. Pending provider-only entries may additionally record `endpointNormalizationPending`, `endpointApiExplicit`, `endpointApiHint`, `endpointValueHint`, `endpointNormalizationBlocked`, and `endpointApiNormalizationBlocked`; these fields distinguish inferred transport values from later user edits.
 - Managed fields are model metadata/capabilities (`name`, reasoning, thinking map, input, cost, context window, max tokens, compat) and provider identity fields (`name`, base URL, API). API keys and headers are user-owned.
 - Pi runtime configuration accepts ordinary Pi fields; `_piModelDoctor` is an unknown-field namespace preserved by the writer and omitted by `stripDoctorMetadata` when creating a runtime-facing object.
 - `models-cache.json` stores the complete normalized catalog; `providers-cache.json` stores schema-versioned provider summaries, adapter ids, environment-variable names, and independent capability signals. `policies-cache.json` stores a versioned `PolicyCatalog` used by capability resolution, including the Pi `0.82.1`/models.dev `api.json` normalized schema-version `1` compatibility baseline and observation date; invalid, old, sensitive, or insecurely-permissioned cache data is ignored and regenerated. Cache writers reject sensitive object keys/values rather than persisting credentials. Cache capability output keeps prompt/context/KV control, pricing, usage, retention, and session-affinity semantics separate; unsupported runtime behavior is advisory rather than enabled. Capability results record confidence/source and cache adapters expose resolved, partial, advisory, or unsupported status independently for prompt/context/KV.
@@ -51,7 +53,7 @@ ModelDoctor.rollback(backupPath: string, options?: { dryRun?: boolean }): Promis
 - Non-interactive mutating commands require `--yes`; `--dry-run` never writes config, backups, or caches. Successful writes include persisted read-back verification and report `persisted-and-active` when the default Pi model registry refreshes and verifies the target, `activation-failed` when refresh or verification fails, or `persisted-reload-required` when a custom models path or unavailable registry prevents activation verification; cancellation and dry-run report `not-persisted`. A no-op migration does not create a backup. Backup retention is explicit only through `cleanup-backups`, never an automatic write-path side effect. `rollback` validates a timestamped backup, backs up the current file, atomically restores the backup, and uses the same runtime activation status.
 - `migrate` preserves safe user fields, reports destination conflicts, keeps the source by default, and only removes it with explicit `--remove-source`. UI mode may select a discovered destination; non-interactive mode requires explicit `--to`. Deprecated destinations remain advisory and are not auto-applied. Endpoint overrides, API keys, OAuth, authorization/secret headers, and user-owned capability fields are not copied across providers. Rollback is performed by validating the timestamped backup, backing up the current file, atomically restoring the backup, and reloading/verifying Pi.
 - `sync` discovers the catalog models for a provider/channel and applies the user-selected subset as one combined proposal and one atomic write. UI mode supports repeated selection with an explicit Done choice; non-interactive mode requires `--models <id1,id2>`.
-- `add` accepts an unlisted third-party channel URL. When the URL has no models.dev provider match, an exact model id/name may be resolved globally from models.dev as metadata-only. A URL given without a model id creates a provider-only entry (endpoint and inferred protocol, no model); `add <provider-id> <endpoint-url>` provides an explicit storage id for the same provider-only setup. Models are attached later with `add <provider-id-or-url> <model>` or `sync`. `--metadata-provider` is required to disambiguate duplicate catalog model ids; `--api` explicitly selects the Pi transport protocol when URL inference is insufficient. In metadata-only mode the channel's endpoint, API, headers, authentication, and unknown transport fields remain authoritative; models.dev provider identity is never copied into those fields. Official provider website metadata is not fetched implicitly, and any separately reviewed provider facts remain advisory until supplied through a supported metadata source.
+- `add` accepts an unlisted third-party channel URL. When the URL has no models.dev provider match, an exact model id/name may be resolved globally from models.dev as metadata-only. `add <url> <model>` adds a channel model in one proposal; `add <provider-id> <endpoint-url> <model>` does the same with an explicit storage id. A URL given without a model id creates a provider-only entry (endpoint and inferred protocol, no model); `add <provider-id> <endpoint-url>` provides an explicit storage id for the same provider-only setup. Provider-only metadata records `endpointNormalizationPending` and the initial inferred `endpointApiHint`; once a model resolves the channel API, only an inferred root endpoint/API is normalized, while an explicit `--api`, explicit non-root path, or later user edit remains authoritative. Models are also attachable later with `add <provider-id-or-url> <model>` or `sync`. `--metadata-provider` is required to disambiguate duplicate catalog model ids; `--api` explicitly selects the Pi transport protocol when URL inference is insufficient. For direct channel/model adds, a root URL receives `/v1` only for `openai-completions` or `openai-responses`; Anthropic and Google families do not receive that suffix. Existing `/v1` and other explicit paths are preserved; query strings and fragments remain attached after an inserted `/v1`. URL-only provider setup does not append a suffix because no model type is available. An explicit `--api` controls the suffix decision, and an already configured channel endpoint remains authoritative. In metadata-only mode the channel's endpoint, API, headers, authentication, and unknown transport fields remain authoritative; models.dev provider identity is never copied into those fields. Official provider website metadata is not fetched implicitly, and any separately reviewed provider facts remain advisory until supplied through a supported metadata source.
 
 ## 4. Validation & Error Matrix
 
@@ -60,6 +62,7 @@ ModelDoctor.rollback(backupPath: string, options?: { dryRun?: boolean }): Promis
 | Missing add target | usage error / `invalid-target` |
 | URL add without model id | provider-only entry (endpoint + protocol, no model); model attach via `add <url> <model>` or `sync` |
 | Provider id + endpoint URL | provider-only entry stored under the explicit provider id; endpoint/API/auth remain channel-owned |
+| Provider id + endpoint URL + model | add the selected model in one proposal; use models.dev only for metadata and preserve channel-owned transport fields |
 | Missing fix/remove model target | `provider/model` validation error |
 | User-edited managed field | warning conflict; preserve user value |
 | Provider/model deprecated in models.dev | warning finding; never auto-delete |
@@ -79,8 +82,8 @@ ModelDoctor.rollback(backupPath: string, options?: { dryRun?: boolean }): Promis
 | Rollback path is not a sibling timestamped backup or contains invalid JSON/schema | `DoctorError("invalid-target"/"backup-error")`; no current-file mutation |
 | Unlisted third-party URL with an exact unique model id | metadata-only proposal using models.dev model facts; preserve channel transport fields |
 | Unlisted third-party URL with duplicate model id | `selection-required` until `--metadata-provider` selects the catalog provider |
-| Third-party `--api` override | use the explicit Pi protocol for the channel; never infer or copy the catalog provider API |
-| Third-party check/fix | report `third-party-channel`; repair model metadata/capability fields only, never endpoint/API/headers/authentication |
+| Third-party `--api` override | use the explicit Pi protocol for the channel; never infer or copy the catalog provider API; use it for root-URL `/v1` normalization |
+| Third-party check/fix | report `third-party-channel`; repair model metadata/capability fields only; pending provider-only channels may normalize only inferred root endpoint/API fields, never explicit endpoint/API/headers/authentication; later endpoint/API edits produce non-repairable conflicts |
 
 ## 5. Good / Base / Bad Cases
 
@@ -89,6 +92,8 @@ ModelDoctor.rollback(backupPath: string, options?: { dryRun?: boolean }): Promis
 - **Bad**: a user changes the proxy `baseUrl`; `fix` reports an endpoint conflict and does not replace the proxy endpoint.
 
 ## 6. Tests Required
+
+Endpoint normalization additions must cover root URLs for OpenAI-compatible completions/responses, idempotent `/v1`, trailing slashes, explicit non-root paths, query/fragment preservation, Anthropic/Google no-suffix behavior, explicit `--api` overrides, direct URL/model and provider-id/endpoint/model forms, and URL-only provider setup without model-based inference.
 
 - `parseCommandArgs`: quoted values, flags, unknown/help path, refresh dry-run flag, optional migrate destination.
 - Capability engines: toggle/effort/budget/adaptive reasoning, unknown fallback, distinct cache capability/control/pricing/usage/retention signals, provider adapters.

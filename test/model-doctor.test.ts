@@ -7,6 +7,8 @@ import { formatFindings, parseCommandArgs, runCommand } from "../src/command.ts"
 import {
   capabilityCompat,
   defaultPolicyCatalog,
+  endpointApiForModel,
+  normalizeEndpointForApi,
   resolveCache,
   resolveReasoning,
   resolveProviderAdapter,
@@ -139,6 +141,11 @@ test("parses unified command arguments, migration flags, help, and unknown paths
     args: ["https://gateway.example/v1", "model"],
     flags: { "metadata-provider": "anthropic", api: "anthropic-messages", "dry-run": true },
   });
+  assert.deepEqual(parseCommandArgs("add providerA https://gateway.example/v1 model --yes"), {
+    command: "add",
+    args: ["providerA", "https://gateway.example/v1", "model"],
+    flags: { yes: true },
+  });
   assert.deepEqual(parseCommandArgs("sync openai --models gpt-one,gpt-two --yes"), {
     command: "sync",
     args: ["openai"],
@@ -245,9 +252,94 @@ test("matches provider URL/model name and lists explicit candidates", () => {
   const matches = ModelsDevClient.match(catalog(), "https://api.openai.com/v1", "GPT Test");
   assert.equal(matches[0]?.provider.id, "openai");
   assert.equal(matches[0]?.model?.id, "gpt-test");
+  const rootMatches = ModelsDevClient.match(catalog(), "https://api.openai.com", "gpt-test");
+  assert.equal(rootMatches[0]?.provider.id, "openai");
+  assert.equal(rootMatches[0]?.model?.id, "gpt-test");
+  const reverseCatalog = normalizeCatalog({
+    openai: { id: "openai", api: "https://api.openai.com", models: { "gpt-test": { id: "gpt-test" } } },
+  });
+  const reverseMatches = ModelsDevClient.match(reverseCatalog, "https://api.openai.com/v1", "gpt-test", { allowPartialProvider: false, allowPartialModel: false });
+  assert.equal(reverseMatches[0]?.provider.id, "openai");
+  assert.equal(reverseMatches[0]?.model?.id, "gpt-test");
   assert.deepEqual(ModelsDevClient.listCandidates(catalog(), "openai").map((item) => item.id), ["gpt-test"]);
   assert.equal(ModelsDevClient.listCandidates(catalog(), "openai")[0]?.confidence, "high");
   assert.equal(ModelsDevClient.find(catalog(), "openai", "gpt")?.model, undefined);
+});
+
+test("normalizes custom channel endpoints from resolved API type", async () => {
+  assert.equal(normalizeEndpointForApi("https://gateway.example", "openai-completions"), "https://gateway.example/v1");
+  assert.equal(normalizeEndpointForApi("https://gateway.example/", "openai-responses"), "https://gateway.example/v1");
+  assert.equal(normalizeEndpointForApi("https://gateway.example/v1", "openai-completions"), "https://gateway.example/v1");
+  assert.equal(normalizeEndpointForApi("https://gateway.example/custom", "openai-completions"), "https://gateway.example/custom");
+  assert.equal(normalizeEndpointForApi("https://gateway.example?route=chat", "openai-completions"), "https://gateway.example/v1?route=chat");
+  assert.equal(normalizeEndpointForApi("https://gateway.example#chat", "openai-completions"), "https://gateway.example/v1#chat");
+  assert.equal(normalizeEndpointForApi("https://gateway.example", "anthropic-messages"), "https://gateway.example");
+  assert.equal(normalizeEndpointForApi("https://gateway.example", "google-generative-ai"), "https://gateway.example");
+  assert.equal(endpointApiForModel(catalog().providers.openai, "https://gateway.example"), "openai-completions");
+  assert.equal(endpointApiForModel(richCatalog().providers.anthropic, "https://gateway.example"), "anthropic-messages");
+  assert.equal(endpointApiForModel(richCatalog().providers.google, "https://gateway.example"), "google-generative-ai");
+  assert.equal(endpointApiForModel(richCatalog().providers.anthropic, "https://gateway.example", "openai-completions"), "openai-completions");
+  assert.equal(endpointApiForModel(undefined, "https://gateway.example"), undefined);
+});
+
+test("adds or preserves channel URL versions from the resolved model API", async () => {
+  const openAiRoot = await mkdtemp(join(tmpdir(), "pi-model-doctor-endpoint-openai-root-"));
+  const openAiDoctor = new ModelDoctor({ paths: paths(openAiRoot), fetcher: { fetchImpl: fetchMock(catalog()) } });
+  const openAi = await openAiDoctor.proposeAdd({ target: "https://gateway.example", modelId: "gpt-test", persistCache: false });
+  assert.equal(openAi.config.providers?.gateway?.baseUrl, "https://gateway.example/v1");
+  await openAiDoctor.applyAdd(openAi);
+  assert.equal((await readModelsJson(paths(openAiRoot).modelsPath)).data.providers?.gateway?.baseUrl, "https://gateway.example/v1");
+
+  const anthropicRoot = await mkdtemp(join(tmpdir(), "pi-model-doctor-endpoint-anthropic-root-"));
+  const anthropicDoctor = new ModelDoctor({ paths: paths(anthropicRoot), fetcher: { fetchImpl: fetchMock(richCatalog()) } });
+  const anthropic = await anthropicDoctor.proposeAdd({ target: "https://custom-anthropic-gateway.example", modelId: "claude-budget", persistCache: false });
+  assert.equal(anthropic.config.providers?.[anthropic.providerId]?.baseUrl, "https://custom-anthropic-gateway.example");
+  assert.equal(anthropic.config.providers?.[anthropic.providerId]?.api, "anthropic-messages");
+  const genericAnthropic = await anthropicDoctor.proposeAdd({ target: "https://custom-gateway.example", modelId: "claude-budget", persistCache: false });
+  assert.equal(genericAnthropic.config.providers?.[genericAnthropic.providerId]?.baseUrl, "https://custom-gateway.example");
+  assert.equal(genericAnthropic.config.providers?.[genericAnthropic.providerId]?.api, "openai-completions");
+  const google = await anthropicDoctor.proposeAdd({ target: "https://custom-google-gateway.example", modelId: "gemini-budget", persistCache: false });
+  assert.equal(google.config.providers?.[google.providerId]?.baseUrl, "https://custom-google-gateway.example");
+
+  const explicitOpenAi = await anthropicDoctor.proposeAdd({ target: "https://custom-gateway.example", modelId: "claude-budget", api: "openai-completions", persistCache: false });
+  assert.equal(explicitOpenAi.config.providers?.[explicitOpenAi.providerId]?.baseUrl, "https://custom-gateway.example/v1");
+  assert.equal(explicitOpenAi.config.providers?.[explicitOpenAi.providerId]?.api, "openai-completions");
+
+  const explicitPath = await openAiDoctor.proposeAdd({ target: "https://gateway.example/custom/", modelId: "gpt-test", persistCache: false });
+  assert.equal(explicitPath.config.providers?.[explicitPath.providerId]?.baseUrl, "https://gateway.example/custom/");
+  const queryPath = await openAiDoctor.proposeAdd({ target: "https://gateway.example?route=chat", modelId: "gpt-test", persistCache: false });
+  assert.equal(queryPath.config.providers?.[queryPath.providerId]?.baseUrl, "https://gateway.example/v1?route=chat");
+  const fragmentRoot = await mkdtemp(join(tmpdir(), "pi-model-doctor-endpoint-fragment-root-"));
+  const fragmentDoctor = new ModelDoctor({ paths: paths(fragmentRoot), fetcher: { fetchImpl: fetchMock(catalog()) } });
+  const fragmentPath = await fragmentDoctor.proposeAdd({ target: "https://fragment-gateway.example#chat", modelId: "gpt-test", persistCache: false });
+  assert.equal(fragmentPath.config.providers?.[fragmentPath.providerId]?.baseUrl, "https://fragment-gateway.example/v1#chat");
+
+  const providerOnly = await fragmentDoctor.proposeAdd({ target: "https://provider-only.example", persistCache: false });
+  assert.equal(providerOnly.config.providers?.[providerOnly.providerId]?.baseUrl, "https://provider-only.example");
+});
+
+test("supports direct provider-id endpoint model setup with URL versioning", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-endpoint-provider-id-"));
+  const doctor = new ModelDoctor({ paths: paths(root), fetcher: { fetchImpl: fetchMock(catalog()) } });
+  const proposal = await doctor.proposeAdd({ target: "https://provider-id.example/", providerId: "providerA", modelId: "gpt-test", persistCache: false });
+  assert.equal(proposal.providerId, "providerA");
+  assert.equal(proposal.config.providers?.providerA?.baseUrl, "https://provider-id.example/v1");
+  assert.equal(proposal.config.providers?.providerA?.models?.[0]?.id, "gpt-test");
+
+  const alreadyVersioned = await doctor.proposeAdd({ target: "https://already-versioned.example/v1/", providerId: "providerB", modelId: "gpt-test", persistCache: false });
+  assert.equal(alreadyVersioned.config.providers?.providerB?.baseUrl, "https://already-versioned.example/v1/");
+
+  const existingRoot = await mkdtemp(join(tmpdir(), "pi-model-doctor-endpoint-existing-root-"));
+  const existingPaths = paths(existingRoot);
+  await writeFile(existingPaths.modelsPath, JSON.stringify({ providers: { providerD: { baseUrl: "https://existing.example/v1", api: "openai-completions", models: [] } } }));
+  const existingDoctor = new ModelDoctor({ paths: existingPaths, fetcher: { fetchImpl: fetchMock(catalog()) } });
+  const existing = await existingDoctor.proposeAdd({ target: "https://existing.example", providerId: "providerD", modelId: "gpt-test", persistCache: false });
+  assert.equal(existing.config.providers?.providerD?.baseUrl, "https://existing.example/v1");
+  assert.equal(existing.config.providers?.providerD?.models?.[0]?.id, "gpt-test");
+
+  const responses = await doctor.proposeAdd({ target: "https://responses.example", providerId: "providerC", modelId: "gpt-test", api: "openai-responses", persistCache: false });
+  assert.equal(responses.config.providers?.providerC?.baseUrl, "https://responses.example/v1");
+  assert.equal(responses.config.providers?.providerC?.api, "openai-responses");
 });
 
 test("rejects ambiguous model discovery instead of selecting a catalog entry", async () => {
@@ -480,6 +572,91 @@ test("adds a provider-only entry when a URL is given without a model id", async 
   assert.equal(saved.data.providers?.gateway?.models?.length, 0);
   assert.equal(saved.data.providers?.gateway?.baseUrl, "https://gateway.example/v1");
 
+  // A provider-only root endpoint is intentionally left unversioned until the
+  // first model is resolved; adding that model then normalizes it.
+  const pendingRoot = await mkdtemp(join(tmpdir(), "pi-model-doctor-provider-only-pending-root-"));
+  const pendingPaths = paths(pendingRoot);
+  const pendingDoctor = new ModelDoctor({ paths: pendingPaths, fetcher: { fetchImpl: fetchMock(catalog()) } });
+  const pending = await pendingDoctor.proposeAdd({ target: "https://pending.example", persistCache: false });
+  assert.equal(pending.config.providers?.pending?.baseUrl, "https://pending.example");
+  await pendingDoctor.applyAdd(pending);
+  const resolved = await pendingDoctor.proposeAdd({ target: "pending", modelId: "gpt-test", persistCache: false });
+  assert.equal(resolved.config.providers?.pending?.baseUrl, "https://pending.example/v1");
+  assert.equal(resolved.plan.changes.some((change) => change.path === "providers.pending.baseUrl"), true);
+  await pendingDoctor.applyAdd(resolved);
+  const pendingSaved = (await readModelsJson(pendingPaths.modelsPath)).data;
+  assert.equal(pendingSaved.providers?.pending?.baseUrl, "https://pending.example/v1");
+  assert.equal(pendingSaved.providers?.pending?._piModelDoctor?.endpointNormalizationPending, false);
+  assert.equal(pendingSaved.providers?.pending?._piModelDoctor?.endpointApiHint, undefined);
+  const pendingCheck = await pendingDoctor.check("pending/gpt-test");
+  assert.equal(pendingCheck.findings.some((finding) => finding.code === "endpoint-mismatch"), false);
+
+  const pendingSyncRoot = await mkdtemp(join(tmpdir(), "pi-model-doctor-provider-only-pending-sync-"));
+  const pendingSyncDoctor = new ModelDoctor({ paths: paths(pendingSyncRoot), fetcher: { fetchImpl: fetchMock(richCatalog()) } });
+  const pendingSync = await pendingSyncDoctor.proposeAdd({ target: "https://pending-sync.example", persistCache: false });
+  await pendingSyncDoctor.applyAdd(pendingSync);
+  const pendingSyncProposal = await pendingSyncDoctor.proposeSync({ target: "pending-sync", modelIds: ["claude-budget"], persistCache: false });
+  assert.equal(pendingSyncProposal.config.providers?.["pending-sync"]?.api, "anthropic-messages");
+  assert.equal(pendingSyncProposal.config.providers?.["pending-sync"]?.baseUrl, "https://pending-sync.example");
+  assert.equal(pendingSyncProposal.config.providers?.["pending-sync"]?._piModelDoctor?.endpointNormalizationPending, false);
+  await pendingSyncDoctor.applySync(pendingSyncProposal);
+  const pendingSyncCheck = await pendingSyncDoctor.check("pending-sync/claude-budget");
+  assert.equal(pendingSyncCheck.findings.some((finding) => finding.code === "api-mismatch" || finding.code === "endpoint-mismatch"), false);
+
+  const pendingAnthropicRoot = await mkdtemp(join(tmpdir(), "pi-model-doctor-provider-only-pending-anthropic-"));
+  const pendingAnthropicDoctor = new ModelDoctor({ paths: paths(pendingAnthropicRoot), fetcher: { fetchImpl: fetchMock(richCatalog()) } });
+  const pendingAnthropic = await pendingAnthropicDoctor.proposeAdd({ target: "https://pending-anthropic.example", persistCache: false });
+  await pendingAnthropicDoctor.applyAdd(pendingAnthropic);
+  const resolvedAnthropic = await pendingAnthropicDoctor.proposeAdd({ target: "pending-anthropic", modelId: "claude-budget", persistCache: false });
+  assert.equal(resolvedAnthropic.config.providers?.[resolvedAnthropic.providerId]?.api, "anthropic-messages");
+  assert.equal(resolvedAnthropic.config.providers?.[resolvedAnthropic.providerId]?.baseUrl, "https://pending-anthropic.example");
+  assert.equal(resolvedAnthropic.plan.changes.some((change) => change.path.endsWith(".baseUrl")), false);
+
+  const explicitTransportRoot = await mkdtemp(join(tmpdir(), "pi-model-doctor-provider-only-explicit-api-"));
+  const explicitTransportDoctor = new ModelDoctor({ paths: paths(explicitTransportRoot), fetcher: { fetchImpl: fetchMock(richCatalog()) } });
+  const explicitTransport = await explicitTransportDoctor.proposeAdd({ target: "https://explicit-transport.example", api: "anthropic-messages", persistCache: false });
+  await explicitTransportDoctor.applyAdd(explicitTransport);
+  const resolvedExplicitTransport = await explicitTransportDoctor.proposeAdd({ target: "explicit-transport", modelId: "gpt-test", persistCache: false });
+  assert.equal(resolvedExplicitTransport.config.providers?.[resolvedExplicitTransport.providerId]?.api, "anthropic-messages");
+  assert.equal(resolvedExplicitTransport.config.providers?.[resolvedExplicitTransport.providerId]?.baseUrl, "https://explicit-transport.example");
+  assert.equal(resolvedExplicitTransport.plan.changes.some((change) => change.path.endsWith(".baseUrl")), false);
+
+  const userChangedApiRoot = await mkdtemp(join(tmpdir(), "pi-model-doctor-provider-only-user-api-"));
+  const userChangedApiPaths = paths(userChangedApiRoot);
+  const userChangedApiDoctor = new ModelDoctor({ paths: userChangedApiPaths, fetcher: { fetchImpl: fetchMock(catalog()) } });
+  const userChangedApi = await userChangedApiDoctor.proposeAdd({ target: "https://user-api.example", persistCache: false });
+  await userChangedApiDoctor.applyAdd(userChangedApi);
+  const userChangedApiConfig = await readModelsJson(userChangedApiPaths.modelsPath);
+  userChangedApiConfig.data.providers?.["user-api"] && (userChangedApiConfig.data.providers["user-api"].api = "google-generative-ai");
+  await writeFile(userChangedApiPaths.modelsPath, JSON.stringify(userChangedApiConfig.data));
+  const resolvedUserChangedApi = await userChangedApiDoctor.proposeAdd({ target: "user-api", modelId: "gpt-test", persistCache: false });
+  assert.equal(resolvedUserChangedApi.config.providers?.["user-api"]?.api, "google-generative-ai");
+  assert.equal(resolvedUserChangedApi.config.providers?.["user-api"]?.baseUrl, "https://user-api.example");
+  assert.equal(resolvedUserChangedApi.plan.changes.some((change) => change.path.endsWith(".api") || change.path.endsWith(".baseUrl")), false);
+  assert.equal(resolvedUserChangedApi.plan.conflicts.some((finding) => finding.code === "api-mismatch"), true);
+  assert.equal(resolvedUserChangedApi.config.providers?.["user-api"]?._piModelDoctor?.endpointApiNormalizationBlocked, true);
+  await userChangedApiDoctor.applyAdd(resolvedUserChangedApi);
+  const userChangedApiCheck = await userChangedApiDoctor.check("user-api/gpt-test");
+  assert.equal(userChangedApiCheck.findings.some((finding) => finding.code === "api-mismatch" && finding.userOwned === true), true);
+  const userChangedApiFix = await userChangedApiDoctor.proposeFix("user-api/gpt-test", { persistCache: false, dryRun: true });
+  assert.equal(userChangedApiFix.result.plan?.changes.some((change) => change.path.endsWith(".api")), false);
+
+  const userChangedEndpointRoot = await mkdtemp(join(tmpdir(), "pi-model-doctor-provider-only-user-endpoint-"));
+  const userChangedEndpointPaths = paths(userChangedEndpointRoot);
+  const userChangedEndpointDoctor = new ModelDoctor({ paths: userChangedEndpointPaths, fetcher: { fetchImpl: fetchMock(catalog()) } });
+  const userChangedEndpoint = await userChangedEndpointDoctor.proposeAdd({ target: "https://original-endpoint.example", persistCache: false });
+  await userChangedEndpointDoctor.applyAdd(userChangedEndpoint);
+  const userChangedEndpointConfig = await readModelsJson(userChangedEndpointPaths.modelsPath);
+  userChangedEndpointConfig.data.providers?.["original-endpoint"] && (userChangedEndpointConfig.data.providers["original-endpoint"].baseUrl = "https://user-proxy.example");
+  await writeFile(userChangedEndpointPaths.modelsPath, JSON.stringify(userChangedEndpointConfig.data));
+  const resolvedUserChangedEndpoint = await userChangedEndpointDoctor.proposeAdd({ target: "original-endpoint", modelId: "gpt-test", persistCache: false });
+  assert.equal(resolvedUserChangedEndpoint.config.providers?.["original-endpoint"]?.baseUrl, "https://user-proxy.example");
+  assert.equal(resolvedUserChangedEndpoint.plan.changes.some((change) => change.path.endsWith(".baseUrl")), false);
+  assert.equal(resolvedUserChangedEndpoint.plan.conflicts.some((finding) => finding.code === "endpoint-mismatch"), true);
+  await userChangedEndpointDoctor.applyAdd(resolvedUserChangedEndpoint);
+  const userChangedEndpointCheck = await userChangedEndpointDoctor.check("original-endpoint/gpt-test");
+  assert.equal(userChangedEndpointCheck.findings.some((finding) => finding.code === "endpoint-mismatch" && finding.userOwned === true), true);
+
   // Adding the same URL again without a model must not duplicate the provider.
   await assert.rejects(
     () => doctor.proposeAdd({ target: "https://gateway.example/v1", persistCache: false }),
@@ -493,6 +670,38 @@ test("adds a provider-only entry when a URL is given without a model id", async 
   const updated = await readModelsJson(targetPaths.modelsPath);
   assert.equal(updated.data.providers?.gateway?.models?.length, 1);
   assert.equal(updated.data.providers?.gateway?.models?.[0]?.id, "gpt-test");
+});
+
+test("sync preserves pending channel transport conflicts and rejects mixed API protocols", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-sync-pending-transport-"));
+  const targetPaths = paths(root);
+  const syncCatalog = normalizeCatalog({
+    openai: { id: "openai", api: "https://api.openai.com/v1", models: { "gpt-test": { id: "gpt-test" } } },
+    anthropic: { id: "anthropic", api: "https://api.anthropic.com", models: { "claude-budget": { id: "claude-budget" } } },
+  });
+  const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(syncCatalog) } });
+  await doctor.applyAdd(await doctor.proposeAdd({ target: "https://pending-sync.example", persistCache: false }));
+  const changed = await readModelsJson(targetPaths.modelsPath);
+  changed.data.providers?.["pending-sync"] && (changed.data.providers["pending-sync"].baseUrl = "https://user-sync-proxy.example");
+  changed.data.providers?.["pending-sync"] && (changed.data.providers["pending-sync"].api = "google-generative-ai");
+  await writeFile(targetPaths.modelsPath, JSON.stringify(changed.data));
+  const proposal = await doctor.proposeSync({ target: "pending-sync", modelIds: ["gpt-test"], persistCache: false });
+  assert.equal(proposal.config.providers?.["pending-sync"]?.baseUrl, "https://user-sync-proxy.example");
+  assert.equal(proposal.config.providers?.["pending-sync"]?.api, "google-generative-ai");
+  assert.equal(proposal.plan.changes.some((change) => change.path.endsWith(".baseUrl") || change.path.endsWith(".api")), false);
+  assert.equal(proposal.plan.conflicts.some((finding) => finding.code === "endpoint-mismatch"), true);
+  assert.equal(proposal.plan.conflicts.some((finding) => finding.code === "api-mismatch"), true);
+  await doctor.applySync(proposal);
+  const checked = await doctor.check("pending-sync/gpt-test");
+  assert.equal(checked.findings.some((finding) => finding.code === "endpoint-mismatch" && finding.userOwned === true), true);
+  assert.equal(checked.findings.some((finding) => finding.code === "api-mismatch" && finding.userOwned === true), true);
+  const mixedRoot = await mkdtemp(join(tmpdir(), "pi-model-doctor-sync-pending-mixed-"));
+  const mixedDoctor = new ModelDoctor({ paths: paths(mixedRoot), fetcher: { fetchImpl: fetchMock(syncCatalog) } });
+  await mixedDoctor.applyAdd(await mixedDoctor.proposeAdd({ target: "https://pending-mixed.example", persistCache: false }));
+  await assert.rejects(
+    () => mixedDoctor.proposeSync({ target: "pending-mixed", modelIds: ["gpt-test", "claude-budget"], persistCache: false }),
+    (error: unknown) => error instanceof DoctorError && /different channel API protocols/.test(error.message),
+  );
 });
 
 test("explicit provider id plus endpoint creates a provider-only channel and supports later model add", async () => {
@@ -527,8 +736,18 @@ test("explicit provider id plus endpoint creates a provider-only channel and sup
   const withModel = await doctor.proposeAdd({ target: "providerA", modelId: "gpt-test", persistCache: false });
   assert.equal(withModel.providerId, "providerA");
   assert.equal(withModel.config.providers?.providerA?.baseUrl, "https://test.example/v1");
+  assert.equal(withModel.plan.changes.some((change) => change.path === "providers.providerA.baseUrl"), false);
   assert.equal(withModel.config.providers?.providerA?.apiKey, "$PROVIDER_A_KEY");
   assert.equal(withModel.config.providers?.providerA?.models?.[0]?.id, "gpt-test");
+  assert.equal(withModel.config.providers?.providerA?._piModelDoctor?.endpointApiHint, undefined);
+
+  const direct = await doctor.proposeAdd({ target: "https://test.example/v1", providerId: "providerA", modelId: "gpt-test", persistCache: false });
+  assert.equal(direct.providerId, "providerA");
+  assert.equal(direct.modelId, "gpt-test");
+  assert.equal(direct.metadataOnly, true);
+  assert.equal(direct.config.providers?.providerA?.baseUrl, "https://test.example/v1");
+  assert.equal(direct.config.providers?.providerA?.apiKey, "$PROVIDER_A_KEY");
+  assert.equal(direct.config.providers?.providerA?.models?.[0]?.id, "gpt-test");
 
   const commandRoot = await mkdtemp(join(tmpdir(), "pi-model-doctor-explicit-provider-command-"));
   const commandDoctor = new ModelDoctor({ paths: paths(commandRoot), fetcher: { fetchImpl: fetchMock(catalog()) } });
@@ -539,6 +758,18 @@ test("explicit provider id plus endpoint creates a provider-only channel and sup
   assert.equal(commandSaved.data.providers?.providerA?.baseUrl, "https://test.example/v1");
   assert.equal(commandSaved.data.providers?.providerA?.apiKey, "$PROVIDER_A_KEY");
   assert.match(notifications.at(-1) ?? "", /Applied/);
+
+  const directCommandRoot = await mkdtemp(join(tmpdir(), "pi-model-doctor-direct-channel-command-"));
+  const directCommandDoctor = new ModelDoctor({ paths: paths(directCommandRoot), fetcher: { fetchImpl: fetchMock(catalog()) } });
+  const directNotifications: string[] = [];
+  const directContext = { hasUI: false, ui: { notify: (message: string) => directNotifications.push(message) } } as never;
+  await runCommand("add providerA https://test.example/v1 gpt-test --yes --api-key $PROVIDER_A_KEY", directContext, directCommandDoctor);
+  const directSaved = await readModelsJson(paths(directCommandRoot).modelsPath);
+  assert.equal(directSaved.data.providers?.providerA?.baseUrl, "https://test.example/v1");
+  assert.equal(directSaved.data.providers?.providerA?.apiKey, "$PROVIDER_A_KEY");
+  assert.equal(directSaved.data.providers?.providerA?.models?.[0]?.id, "gpt-test");
+  assert.equal(directSaved.data.providers?.providerA?.models?.[0]?.compat?.metadataOnly, true);
+  assert.match(directNotifications.at(-1) ?? "", /Applied/);
 });
 
 test("provider-only URL add accepts an API key reference and keeps official catalog identity", async () => {
@@ -1092,6 +1323,34 @@ test("runtime verification failures are reported after persistence", async () =>
     if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
   }
+});
+
+test("headless direct channel model add supports URL targets and explicit provider ids", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-direct-channel-url-command-"));
+  const targetPaths = paths(root);
+  const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(catalog()) } });
+  const notifications: string[] = [];
+  const ctx = { hasUI: false, ui: { notify: (message: string) => notifications.push(message) } } as never;
+  await runCommand("add https://gateway.example/v1 gpt-test --yes", ctx, doctor);
+  const saved = await readModelsJson(targetPaths.modelsPath);
+  assert.equal(saved.data.providers?.gateway?.baseUrl, "https://gateway.example/v1");
+  assert.equal(saved.data.providers?.gateway?.models?.[0]?.id, "gpt-test");
+  assert.equal(saved.data.providers?.gateway?.models?.[0]?.compat?.metadataOnly, true);
+  assert.match(notifications.at(-1) ?? "", /Applied/);
+});
+
+test("headless direct channel model add requires --yes and writes with explicit authorization", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-direct-channel-auth-"));
+  const targetPaths = paths(root);
+  const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(catalog()) } });
+  const notifications: string[] = [];
+  const ctx = { hasUI: false, ui: { notify: (message: string) => notifications.push(message) } } as never;
+  await runCommand("add providerA https://gateway.example/v1 gpt-test", ctx, doctor);
+  assert.match(notifications.at(-1) ?? "", /requires --yes/);
+  assert.equal((await readdir(root)).some((file) => file.startsWith("models.json.bak-")), false);
+  await runCommand("add providerA https://gateway.example/v1 gpt-test --yes", ctx, doctor);
+  const saved = await readModelsJson(targetPaths.modelsPath);
+  assert.equal(saved.data.providers?.providerA?.models?.[0]?.id, "gpt-test");
 });
 
 test("extension command rejects headless writes without --yes and accepts explicit --yes", async () => {

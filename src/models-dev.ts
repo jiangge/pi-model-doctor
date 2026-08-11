@@ -199,7 +199,7 @@ export class ModelsDevClient {
           ? 60
           : 0;
       if (!providerMatch && !looksLikeUrl(target)) continue;
-      const urlMatch = typeof providerEndpoint === "string" && looksLikeUrl(target) && normalizeUrl(providerEndpoint) === normalizeUrl(target);
+      const urlMatch = typeof providerEndpoint === "string" && looksLikeUrl(target) && catalogEndpointMatches(provider, providerEndpoint, target);
       const score = urlMatch ? 110 : providerMatch;
       if (!score) continue;
       const matchedBy = urlMatch ? ["api-url"] : [providerMatch === 100 ? "provider-id-or-name" : "provider-partial"];
@@ -306,7 +306,7 @@ export class ModelsDevClient {
     if (direct || !endpoint) return direct;
     const endpointMatches = this.match(catalog, endpoint, modelId, { allowPartialModel: false, allowPartialProvider: false }).filter((match) => {
       const providerEndpoint = inferProviderEndpoint(match.provider);
-      return providerEndpoint && normalizeUrl(providerEndpoint) === normalizeUrl(endpoint);
+      return providerEndpoint && catalogEndpointMatches(match.provider, providerEndpoint, endpoint);
     });
     if (endpointMatches.length === 0) return direct;
     const bestScore = endpointMatches[0]?.score ?? 0;
@@ -803,6 +803,25 @@ function normalizeKey(value: string): string {
 
 function normalizeUrl(value: string): string {
   return value.trim().toLowerCase().replace(/\/$/, "");
+}
+
+function catalogEndpointMatches(provider: ModelsDevProvider, providerEndpoint: string, target: string): boolean {
+  if (normalizeUrl(providerEndpoint) === normalizeUrl(target)) return true;
+  try {
+    const expected = new URL(providerEndpoint);
+    const actual = new URL(target);
+    const expectedPath = expected.pathname.replace(/\/+$/u, "") || "/";
+    const actualPath = actual.pathname.replace(/\/+$/u, "") || "/";
+    if (expected.protocol !== actual.protocol || expected.hostname !== actual.hostname || expected.port !== actual.port
+      || expected.search !== actual.search || expected.hash !== actual.hash) return false;
+    const api = detectPiApi(provider, providerEndpoint);
+    if (api !== "openai-completions" && api !== "openai-responses") return false;
+    const rootToV1 = (expectedPath === "/" && actualPath === "/v1")
+      || (expectedPath === "/v1" && actualPath === "/");
+    return rootToV1;
+  } catch {
+    return false;
+  }
 }
 
 function looksLikeUrl(value: string): boolean {

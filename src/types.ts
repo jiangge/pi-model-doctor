@@ -16,6 +16,18 @@ export interface DoctorMetadata {
   autoRepair: boolean;
   providerId?: string;
   modelId?: string;
+  /** True while a provider-only endpoint is waiting for model/API resolution. */
+  endpointNormalizationPending?: boolean;
+  /** True when the endpoint API was explicitly supplied rather than inferred. */
+  endpointApiExplicit?: boolean;
+  /** API family inferred or selected when the provider-only endpoint was created. */
+  endpointApiHint?: PiApi;
+  /** Exact endpoint value inferred when the provider-only entry was created. */
+  endpointValueHint?: string;
+  /** True when the user changed the pending endpoint before model resolution. */
+  endpointNormalizationBlocked?: boolean;
+  /** True when the user changed the pending API before model resolution. */
+  endpointApiNormalizationBlocked?: boolean;
   version?: number;
   managedFields?: string[];
   managedValues?: JsonObject;
@@ -449,7 +461,7 @@ export type RuntimeActivationStatus = "persisted-and-active" | "persisted-reload
 
 export interface AddInput {
   target: string;
-  /** Explicit storage id for provider-only URL setup, as in `add providerA https://gateway.example/v1`. */
+  /** Explicit storage id for channel setup, as in `add providerA https://gateway.example/v1 [model]`. */
   providerId?: string;
   /** When omitted and target is a URL, a provider-only entry with no model is created. */
   modelId?: string;

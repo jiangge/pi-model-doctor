@@ -139,15 +139,32 @@ export function buildMetadata(
   const compatiblePrevious = previous?.version === MODEL_DOCTOR_VERSION ? previous : undefined;
   const previousFields = compatiblePrevious?.managedFields ?? [];
   const previousValues = compatiblePrevious?.managedValues ?? {};
-  return {
+  const metadata: DoctorMetadata = {
     ...(compatiblePrevious ?? {}),
     managed: true,
     source: details.source,
     lastCheck: details.lastCheck,
     autoRepair: details.autoRepair,
-    providerId: details.providerId,
-    modelId: details.modelId,
     version: MODEL_DOCTOR_VERSION,
+  };
+  if (details.providerId !== undefined) metadata.providerId = details.providerId;
+  else delete metadata.providerId;
+  if (details.modelId !== undefined) metadata.modelId = details.modelId;
+  else delete metadata.modelId;
+  if (details.endpointNormalizationPending !== undefined) metadata.endpointNormalizationPending = details.endpointNormalizationPending;
+  else delete metadata.endpointNormalizationPending;
+  if (details.endpointApiExplicit !== undefined) metadata.endpointApiExplicit = details.endpointApiExplicit;
+  else delete metadata.endpointApiExplicit;
+  if (details.endpointApiHint !== undefined) metadata.endpointApiHint = details.endpointApiHint;
+  else delete metadata.endpointApiHint;
+  if (details.endpointValueHint !== undefined) metadata.endpointValueHint = details.endpointValueHint;
+  else delete metadata.endpointValueHint;
+  if (details.endpointNormalizationBlocked !== undefined) metadata.endpointNormalizationBlocked = details.endpointNormalizationBlocked;
+  else delete metadata.endpointNormalizationBlocked;
+  if (details.endpointApiNormalizationBlocked !== undefined) metadata.endpointApiNormalizationBlocked = details.endpointApiNormalizationBlocked;
+  else delete metadata.endpointApiNormalizationBlocked;
+  return {
+    ...metadata,
     managedFields: [...new Set([...previousFields, ...managedFields])],
     managedValues: cloneJson({ ...previousValues, ...managedValues }),
   } as DoctorMetadata;

@@ -287,6 +287,58 @@ export function detectChannelApi(endpoint?: string, explicitApi?: PiApi): PiApi 
   return "openai-completions";
 }
 
+/**
+ * Resolve an API family for endpoint-versioning only.
+ *
+ * A custom channel still owns the transport API written to models.json. This
+ * helper is deliberately separate so a unique models.dev match can provide a
+ * conservative `/v1` hint without copying catalog provider identity into the
+ * channel. Explicit channel API and recognizable endpoint names win; an
+ * unknown catalog provider does not silently become OpenAI-compatible.
+ */
+export function endpointApiForModel(
+  provider: ModelsDevProvider | undefined,
+  endpoint?: string,
+  explicitApi?: PiApi,
+): PiApi | undefined {
+  if (explicitApi) return explicitApi;
+  // A recognizable endpoint protocol is stronger evidence than the catalog
+  // provider identity because a third-party gateway can proxy any model.
+  const endpointApi = detectChannelApi(endpoint);
+  if (endpointApi !== "openai-completions") return endpointApi;
+  if (provider) {
+    const adapter = resolveProviderAdapter(provider, provider.api);
+    if (adapter.id === "anthropic") return "anthropic-messages";
+    if (adapter.id === "google") return "google-generative-ai";
+    if (adapter.id === "openai-responses") return "openai-responses";
+    if (["openai-compatible", "openrouter", "deepseek", "together", "zai", "qwen"].includes(adapter.id)) {
+      return "openai-completions";
+    }
+  }
+  // A generic URL with unknown metadata remains unresolved rather than being
+  // silently treated as OpenAI-compatible.
+  return undefined;
+}
+
+/**
+ * Add the OpenAI-compatible `/v1` base path only when the supplied URL is a
+ * root URL. Any non-root path is an explicit endpoint shape and is
+ * preserved; query strings and fragments stay attached after the inserted
+ * path. The operation is idempotent.
+ */
+export function normalizeEndpointForApi(endpoint: string | undefined, api: PiApi | undefined): string | undefined {
+  if (!endpoint || (api !== "openai-completions" && api !== "openai-responses")) return endpoint;
+  try {
+    const parsed = new URL(endpoint);
+    const rootPath = parsed.pathname.replace(/\/+$/u, "") === "";
+    if (!rootPath) return endpoint;
+    parsed.pathname = "/v1";
+    return parsed.toString();
+  } catch {
+    return endpoint;
+  }
+}
+
 export function detectPiApi(provider: ModelsDevProvider, endpoint?: string, explicitApi?: PiApi): PiApi {
   if (explicitApi) return explicitApi;
   const haystack = `${provider.id} ${provider.name ?? ""} ${provider.api ?? ""} ${endpoint ?? ""}`.toLowerCase();
