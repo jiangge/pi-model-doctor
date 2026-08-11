@@ -240,7 +240,11 @@ async function runSync(args: string[], flags: Record<string, string | boolean>, 
       const doneLabel = `Done (${selected.length} selected)`;
       const choices = [...remaining.map((candidate, index) => formatCandidateLabel(candidate, index)), doneLabel];
       const choice = await ctx.ui.select(`Select models to sync for ${redactSensitiveText(target)}; choose Done when finished`, choices);
-      if (!choice || choice === doneLabel) break;
+      if (!choice) {
+        ctx.ui.notify("Sync cancelled. Status: not-persisted; models.json was not changed.", "info");
+        return;
+      }
+      if (choice === doneLabel) break;
       const selectedIndex = choices.indexOf(choice);
       const candidate = selectedIndex >= 0 ? remaining[selectedIndex] : undefined;
       if (!candidate) throw new DoctorError("The selected model is no longer available; retry model discovery", "invalid-target");

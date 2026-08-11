@@ -557,6 +557,39 @@ test("interactive sync selects several models and supports Done", async () => {
   assert.match(notifications.at(-1) ?? "", /Synced/);
 });
 
+test("interactive sync cancellation after selection does not write", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-sync-ui-cancel-"));
+  const targetPaths = paths(root);
+  const multiCatalog = normalizeCatalog({
+    openai: {
+      id: "openai",
+      api: "https://api.openai.com/v1",
+      models: {
+        "gpt-one": { id: "gpt-one" },
+        "gpt-two": { id: "gpt-two" },
+      },
+    },
+  });
+  const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(multiCatalog) } });
+  const notifications: string[] = [];
+  let selections = 0;
+  const ctx = {
+    hasUI: true,
+    ui: {
+      notify: (message: string) => notifications.push(message),
+      select: async (_prompt: string, choices: string[]) => {
+        selections += 1;
+        return selections === 1 ? choices[0] : undefined;
+      },
+      confirm: async () => true,
+    },
+  } as never;
+  await runCommand("sync openai", ctx, doctor);
+  assert.match(notifications.at(-1) ?? "", /Sync cancelled.*not-persisted/s);
+  await assert.rejects(() => readFile(targetPaths.modelsPath));
+  assert.equal((await readdir(root)).some((file) => file.startsWith("models.json.bak-")), false);
+});
+
 test("adds a provider-only entry when a URL is given without a model id", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-provider-only-"));
   const targetPaths = paths(root);
@@ -885,6 +918,47 @@ test("forced refresh preserves stale cache when network is unavailable", async (
   assert.match(result.warning ?? "", /using cached catalog/);
 });
 
+test("network refresh preserves prior validators when a 200 response omits them", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-cache-validator-preserve-"));
+  const targetPaths = paths(root);
+  const cache = new CacheStore(targetPaths);
+  const first = new ModelsDevClient(cache, {
+    fetchImpl: fetchMock(catalog(), 200, { "content-type": "application/json", etag: "old-etag", "last-modified": "Wed, 01 Aug 2026 00:00:00 GMT" }),
+  });
+  await first.load({ force: true });
+  const seen: RequestInit[] = [];
+  const second = new ModelsDevClient(cache, {
+    fetchImpl: (async (_url, init) => {
+      seen.push(init ?? {});
+      return new Response(JSON.stringify(catalog()), { status: 200, headers: { "content-type": "application/json" } });
+    }) as typeof fetch,
+  });
+  await second.load({ force: true });
+  const headers = seen[0]?.headers as Record<string, string>;
+  assert.equal(headers["if-none-match"], "old-etag");
+  assert.equal(headers["if-modified-since"], "Wed, 01 Aug 2026 00:00:00 GMT");
+  const stored = JSON.parse(await readFile(targetPaths.modelsCachePath, "utf8")) as { etag?: string; lastModified?: string };
+  assert.equal(stored.etag, "old-etag");
+  assert.equal(stored.lastModified, "Wed, 01 Aug 2026 00:00:00 GMT");
+});
+
+test("unsafe response validators are rejected without caching", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-unsafe-response-validator-"));
+  const targetPaths = paths(root);
+  const client = new ModelsDevClient(new CacheStore(targetPaths), {
+    fetchImpl: (async () => new Response(JSON.stringify(catalog()), {
+      status: 200,
+      headers: { "content-type": "application/json", etag: "Bearer SECRET_TOKEN" },
+    })) as typeof fetch,
+  });
+  await assert.rejects(
+    () => client.load({ force: true }),
+    (error: unknown) => error instanceof ModelsDevError && error.code === "invalid-catalog",
+  );
+  await assert.rejects(() => readFile(targetPaths.modelsCachePath));
+  await assert.rejects(() => readFile(targetPaths.providersCachePath));
+});
+
 test("policy cache is read and used by capability fallback resolution", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-policy-runtime-"));
   const targetPaths = paths(root);
@@ -1000,6 +1074,42 @@ test("check validates required and conflicting headers without exposing values",
   assert.equal(result.findings.some((item) => item.code === "headers-preserved"), true);
   assert.equal(formatFindings(result).includes("SECRET"), false);
   assert.equal(formatFindings(result).includes("OTHER"), false);
+});
+
+test("user-deleted managed provider identity fields remain non-repairable", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-provider-deleted-fields-"));
+  const targetPaths = paths(root);
+  await writeFile(targetPaths.modelsPath, JSON.stringify({
+    providers: {
+      openai: {
+        models: [{ id: "gpt-test" }],
+        _piModelDoctor: {
+          managed: true,
+          source: "models.dev",
+          lastCheck: "2026-08-01T00:00:00.000Z",
+          autoRepair: true,
+          version: 1,
+          managedFields: ["name", "baseUrl", "api"],
+          managedValues: {
+            name: "OpenAI",
+            baseUrl: "https://api.openai.com/v1",
+            api: "openai-completions",
+          },
+        },
+      },
+    },
+  }));
+  const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(catalog()) } });
+  const result = await doctor.check("openai/gpt-test");
+  const identityFindings = result.findings.filter((item) => (
+    item.code === "api-mismatch" && item.message.startsWith("Configured provider API")
+  ) || (
+    item.code === "endpoint-mismatch" && item.message.startsWith("Configured endpoint")
+  ) || (
+    item.code === "metadata-stale" && item.message.startsWith("Provider name")
+  ));
+  assert.equal(identityFindings.length, 3);
+  assert.ok(identityFindings.every((item) => item.repairable === false && item.userOwned === true));
 });
 
 test("migrate creates a destination, preserves user fields, and can remove the source explicitly", async () => {

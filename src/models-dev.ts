@@ -1,6 +1,6 @@
 import { isIP } from "node:net";
 import { CacheStore } from "./cache.ts";
-import { errorMessage, isRecord, isSafeHeaderName, redactSensitiveText } from "./json.ts";
+import { errorMessage, isRecord, isSafeHeaderName, looksLikeCredentialValue, redactSensitiveText } from "./json.ts";
 import { capabilityCompat, defaultPolicyCatalog, detectPiApi, inferProviderEndpoint, resolveCache, resolveProviderAdapter, resolveReasoning } from "./capabilities.ts";
 import {
   DEFAULT_MODELS_DEV_ENDPOINT,
@@ -58,7 +58,7 @@ export class ModelsDevClient {
   }
 
   async load(options: { force?: boolean; persist?: boolean; refresh?: boolean } = {}): Promise<CatalogLoadResult> {
-    if (this.memory && (options.persist === false || this.memoryPersisted) && !options.force && !options.refresh && this.memory.catalog.fetchedAt !== undefined && isCacheFresh(this.memory.catalog.fetchedAt, this.now(), this.cacheTtlMs)) {
+    if (this.memory && !this.memory.stale && (options.persist === false || this.memoryPersisted) && !options.force && !options.refresh && this.memory.catalog.fetchedAt !== undefined && isCacheFresh(this.memory.catalog.fetchedAt, this.now(), this.cacheTtlMs)) {
       return this.memory;
     }
     const cached = await this.cache.readModels<ModelsDevCatalog>();
@@ -97,7 +97,7 @@ export class ModelsDevClient {
         throw new ModelsDevError(`models.dev response was not valid JSON: ${errorMessage(error)}`, "invalid-catalog", error);
       }
       const catalog = normalizeCatalog(raw, this.now());
-      if (options.persist !== false) await this.persistCatalog(catalog, response);
+      if (options.persist !== false) await this.persistCatalog(catalog, response, validCached);
       return this.remember({ catalog, source: "network", stale: false }, options.persist !== false);
     } catch (error) {
       if (error instanceof ModelsDevError && error.code === "invalid-catalog") throw error;
@@ -108,7 +108,7 @@ export class ModelsDevClient {
           source: "cache",
           stale: true,
           warning: `models.dev unavailable; using cached catalog (${errorMessage(error)})`,
-        }, true);
+        }, options.persist !== false);
       }
       if (error instanceof ModelsDevError) throw error;
       throw new ModelsDevError(`Unable to load models.dev: ${errorMessage(error)}`, "network-unavailable", error);
@@ -130,9 +130,11 @@ export class ModelsDevClient {
     response: Response,
     previous?: { etag?: string; lastModified?: string },
   ): Promise<void> {
+    const responseEtag = safeResponseValidator(response.headers.get("etag"), "ETag");
+    const responseLastModified = safeResponseValidator(response.headers.get("last-modified"), "Last-Modified");
     const headers = {
-      etag: response.headers.get("etag") ?? previous?.etag,
-      lastModified: response.headers.get("last-modified") ?? previous?.lastModified,
+      etag: responseEtag ?? previous?.etag,
+      lastModified: responseLastModified ?? previous?.lastModified,
     };
     await this.cache.writeModels(catalog, headers);
     const providerSummaries: ProviderCacheData["providers"] = Object.fromEntries(Object.entries(catalog.providers).map(([id, provider]) => {
@@ -892,6 +894,14 @@ function isNormalizedModel(value: unknown): value is ModelsDevModel {
 
 function isPositiveInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && Number.isFinite(value) && value > 0;
+}
+
+function safeResponseValidator(value: string | null, label: string): string | undefined {
+  if (value === null || value === "") return undefined;
+  if (/[\r\n]/u.test(value) || looksLikeCredentialValue(value)) {
+    throw new ModelsDevError(`models.dev response ${label} header was unsafe`, "invalid-catalog");
+  }
+  return value;
 }
 
 function isSafeCachedApiUrl(value: string): boolean {

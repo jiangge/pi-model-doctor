@@ -1457,11 +1457,12 @@ function checkModel(providerId: string, provider: PiProvider, model: PiModel, so
     && isPiApi(expectedApi)
     && provider.api !== expectedApi;
   if ((!transportOwned || transportApiMismatch) && provider.api !== expectedApi) {
-    const repairable = pendingApiAutoRepair || !transportOwned && (provider.api === undefined || canManageField(provider, "api"));
-    findings.push(finding("api-mismatch", "warning", target, `Configured provider API is ${provider.api ?? "unset"}; expected ${expectedApi}`, repairable, !repairable && transportOwned));
+    const repairable = pendingApiAutoRepair || !transportOwned && canManageField(provider, "api");
+    findings.push(finding("api-mismatch", "warning", target, `Configured provider API is ${provider.api ?? "unset"}; expected ${expectedApi}`, repairable, !repairable));
   }
   if (!transportOwned && expectedEndpoint && provider.baseUrl !== expectedEndpoint) {
-    findings.push(finding("endpoint-mismatch", "warning", target, `Configured endpoint is ${provider.baseUrl ?? "unset"}; models.dev expects ${expectedEndpoint}`, provider.baseUrl === undefined || canManageField(provider, "baseUrl"), provider.baseUrl !== undefined && !canManageField(provider, "baseUrl")));
+    const repairable = canManageField(provider, "baseUrl");
+    findings.push(finding("endpoint-mismatch", "warning", target, `Configured endpoint is ${provider.baseUrl ?? "unset"}; models.dev expects ${expectedEndpoint}`, repairable, !repairable));
   } else if (metadataOnly) {
     findings.push(finding("third-party-channel", "info", target, `Using ${sourceProvider.id}/${sourceModel.id} from models.dev as model metadata only; the configured channel endpoint, protocol, headers, and authentication are authoritative`, false));
   }
@@ -1479,7 +1480,7 @@ function checkModel(providerId: string, provider: PiProvider, model: PiModel, so
   }
   if (sourceModel.status === "deprecated" || sourceModel.deprecated === true) findings.push(finding("deprecated-model", "warning", target, "models.dev marks this model as deprecated", false));
   if (!transportOwned && sourceProvider.name !== undefined && provider.name !== sourceProvider.name) {
-    const repairable = provider.name === undefined || canManageField(provider, "name");
+    const repairable = canManageField(provider, "name");
     findings.push(finding("metadata-stale", "info", target, `Provider name is ${provider.name ?? "unset"}; models.dev says ${sourceProvider.name}`, repairable, !repairable, "models.dev", "medium"));
   }
   if (model.id !== sourceModel.id) findings.push(finding("model-id-mismatch", "warning", target, `Configured model id ${model.id} does not match metadata id ${sourceModel.id}`, false, true));
