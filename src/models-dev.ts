@@ -500,7 +500,7 @@ function normalizeModel(id: string, rawModel: JsonRecord, providerId: string): M
   }
   if (safeModel.reasoning_options !== undefined && (!Array.isArray(safeModel.reasoning_options) || !safeModel.reasoning_options.every(isValidReasoningOption))) throw new ModelsDevError(`models.dev model ${providerId}/${id} has invalid reasoning options`, "invalid-catalog");
   if (safeModel.required_headers !== undefined && (!Array.isArray(safeModel.required_headers) || !safeModel.required_headers.every((item) => isSafeHeaderName(item)))) throw new ModelsDevError(`models.dev model ${providerId}/${id} has invalid required headers`, "invalid-catalog");
-  if (!isOptionalMetadataObject(safeModel.retention) || !isOptionalMetadataObject(safeModel.usage) || !isOptionalMetadataObject(safeModel.interleaved) || !isOptionalSessionAffinity(safeModel.session_affinity)) throw new ModelsDevError(`models.dev model ${providerId}/${id} has invalid cache metadata`, "invalid-catalog");
+  if (!isOptionalMetadataObject(safeModel.retention) || !isOptionalMetadataObject(safeModel.usage) || !isOptionalInterleavedMetadata(safeModel.interleaved) || !isOptionalSessionAffinity(safeModel.session_affinity)) throw new ModelsDevError(`models.dev model ${providerId}/${id} has invalid cache metadata`, "invalid-catalog");
   const model: ModelsDevModel = {
     ...safeModel,
     id,
@@ -577,6 +577,10 @@ function isValidReasoningOption(value: unknown): value is JsonRecord {
 
 function isOptionalMetadataObject(value: unknown): boolean {
   return value === undefined || isRecord(value);
+}
+
+function isOptionalInterleavedMetadata(value: unknown): boolean {
+  return value === undefined || typeof value === "boolean" || isRecord(value);
 }
 
 function isOptionalSessionAffinity(value: unknown): boolean {
@@ -888,7 +892,7 @@ function isNormalizedModel(value: unknown): value is ModelsDevModel {
     if (value.cost.tiers !== undefined && (!Array.isArray(value.cost.tiers) || !value.cost.tiers.every(isValidCostTier))) return false;
   }
   if (value.required_headers !== undefined && (!Array.isArray(value.required_headers) || !value.required_headers.every((item) => isSafeHeaderName(item)))) return false;
-  if (!isOptionalMetadataObject(value.retention) || !isOptionalMetadataObject(value.usage) || !isOptionalMetadataObject(value.interleaved) || !isOptionalSessionAffinity(value.session_affinity)) return false;
+  if (!isOptionalMetadataObject(value.retention) || !isOptionalMetadataObject(value.usage) || !isOptionalInterleavedMetadata(value.interleaved) || !isOptionalSessionAffinity(value.session_affinity)) return false;
   return true;
 }
 

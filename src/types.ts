@@ -213,7 +213,7 @@ export interface ModelsDevModel {
   status?: string;
   deprecated?: boolean;
   last_updated?: string;
-  interleaved?: JsonObject;
+  interleaved?: JsonObject | boolean;
   retention?: JsonObject;
   session_affinity?: JsonObject | string;
   usage?: JsonObject;

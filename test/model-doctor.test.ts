@@ -856,6 +856,38 @@ test("cache writes atomically, stores policy schema, and falls back to valid cac
   assert.match(result.warning ?? "", /cached catalog/);
 });
 
+test("boolean interleaved metadata does not block unrelated model discovery and remains valid in cache", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-boolean-interleaved-"));
+  const targetPaths = paths(root);
+  const rawCatalog = {
+    wong: {
+      id: "wong",
+      models: {
+        "gpt-5.6-sol": { id: "gpt-5.6-sol" },
+      },
+    },
+    "cloudflare-workers-ai": {
+      id: "cloudflare-workers-ai",
+      models: {
+        "@cf/nvidia/nemotron-3-120b-a12b": {
+          id: "@cf/nvidia/nemotron-3-120b-a12b",
+          interleaved: true,
+        },
+      },
+    },
+  };
+  const online = new ModelsDevClient(new CacheStore(targetPaths), { fetchImpl: fetchMock(rawCatalog) });
+  const loaded = await online.load({ force: true });
+  assert.equal(loaded.source, "network");
+  assert.equal(ModelsDevClient.find(loaded.catalog, "wong", "gpt-5.6-sol")?.model?.id, "gpt-5.6-sol");
+  assert.equal(loaded.catalog.providers["cloudflare-workers-ai"].models["@cf/nvidia/nemotron-3-120b-a12b"].interleaved, true);
+
+  const cached = new ModelsDevClient(new CacheStore(targetPaths), { fetchImpl: (async () => { throw new Error("cache should be used"); }) as typeof fetch });
+  const cachedResult = await cached.load();
+  assert.equal(cachedResult.source, "cache");
+  assert.equal(cachedResult.catalog.providers["cloudflare-workers-ai"].models["@cf/nvidia/nemotron-3-120b-a12b"].interleaved, true);
+});
+
 test("refresh uses conditional headers and reports configuration findings without writing models.json", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-refresh-"));
   const targetPaths = paths(root);
@@ -1615,6 +1647,12 @@ test("catalog normalization preserves non-secret token metadata and strips crede
   assert.throws(() => normalizeCatalog({ test: { id: "test", api: "https://[::1]/v1", models: {} } }), (error: unknown) => error instanceof ModelsDevError && error.code === "invalid-catalog");
   assert.throws(() => normalizeCatalog({ test: { id: "test", models: { model: { id: "MODEL" } } } }), (error: unknown) => error instanceof ModelsDevError && error.code === "invalid-catalog");
   assert.throws(() => normalizeCatalog({ test: { id: "test", models: { model: { id: "model", reasoning_options: [{ type: "budget", min: 10, max: 5 }] } } } }), (error: unknown) => error instanceof ModelsDevError && error.code === "invalid-catalog");
+  for (const interleaved of [1, "enabled"]) {
+    assert.throws(
+      () => normalizeCatalog({ test: { id: "test", models: { model: { id: "model", interleaved } } } }),
+      (error: unknown) => error instanceof ModelsDevError && error.code === "invalid-catalog",
+    );
+  }
 });
 
 test("secret redaction covers auth headers, OAuth, and nested headers", () => {

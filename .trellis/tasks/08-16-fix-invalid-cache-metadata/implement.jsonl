@@ -1,0 +1,6 @@
+{"file":".trellis/spec/backend/index.md","reason":"Backend guideline entry point for the catalog validator change."}
+{"file":".trellis/spec/backend/model-doctor-contract.md","reason":"Defines models.dev normalization, cache validation, and add behavior contracts."}
+{"file":".trellis/spec/backend/error-handling.md","reason":"Requires malformed catalog data to remain typed invalid-catalog while valid cache fallback stays strict."}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"Requires unknown external JSON guards, regression tests, typecheck, and test suite verification."}
+{"file":".trellis/spec/guides/index.md","reason":"Shared pre-modification and consistency checklist."}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Network normalization and normalized-cache validation must reuse one interleaved rule."}

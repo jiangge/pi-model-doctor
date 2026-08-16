@@ -1,0 +1,4 @@
+{"file":".trellis/spec/backend/index.md","reason":"Backend quality-check entry point."}
+{"file":".trellis/spec/backend/model-doctor-contract.md","reason":"Verify catalog normalization and cache behavior remain contract-compatible."}
+{"file":".trellis/spec/backend/error-handling.md","reason":"Verify unsupported primitive metadata still returns typed invalid-catalog."}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"Verify regression coverage, strict typing, tests, and diff checks."}
