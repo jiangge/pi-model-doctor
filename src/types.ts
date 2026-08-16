@@ -189,7 +189,7 @@ export interface ModelsDevModel {
   family?: string;
   attachment?: boolean;
   reasoning?: boolean;
-  reasoning_options?: Array<{ type?: string; values?: string[]; min?: number; max?: number }>;
+  reasoning_options?: Array<{ type?: string; values?: Array<string | null>; min?: number; max?: number }>;
   tool_call?: boolean;
   temperature?: boolean;
   modalities?: { input?: string[]; output?: string[] };

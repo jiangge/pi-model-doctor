@@ -197,7 +197,7 @@ export function isProviderCacheData(value: unknown): value is ProviderCacheData 
     if (summary.name !== undefined && typeof summary.name !== "string") return false;
     if (summary.api !== undefined && typeof summary.api !== "string") return false;
     if (summary.doc !== undefined && typeof summary.doc !== "string") return false;
-    if (summary.env !== undefined && (!Array.isArray(summary.env) || !summary.env.every((item) => typeof item === "string" && /^[A-Z][A-Z0-9_]*$/.test(item)))) return false;
+    if (summary.env !== undefined && (!Array.isArray(summary.env) || !summary.env.every((item) => typeof item === "string" && /^[A-Z0-9][A-Z0-9_]*$/.test(item)))) return false;
     if (summary.required_headers !== undefined && (!Array.isArray(summary.required_headers) || !summary.required_headers.every((item) => isSafeHeaderName(item)))) return false;
     return true;
   });

@@ -343,17 +343,18 @@ async function runAdd(args: string[], flags: Record<string, string | boolean>, c
   const preview = [
     `Proposed ${redactSensitiveText(proposal.target)}`,
     `Source: ${proposal.catalogSource}; matched by: ${proposal.matchedBy.join(", ") || "explicit fallback"}`,
+    proposal.metadataProviderId ? `Metadata provider: ${redactSensitiveText(proposal.metadataProviderId)} (channel transport and credentials remain unchanged)` : undefined,
     `Adapter: ${proposal.adapter}; confidence: ${proposal.confidence}; reasoning: ${proposal.reasoningControlType}; cache: prompt=${proposal.cacheCapabilities.prompt}, context=${proposal.cacheCapabilities.context}, kv=${proposal.cacheCapabilities.kv}`,
     `Required headers: ${proposal.requiredHeaders.length > 0 ? proposal.requiredHeaders.join(", ") : "none detected"} (values are never displayed)`,
     proposal.warning ? `Warning: ${redactSensitiveText(proposal.warning)}` : undefined,
     formatPlan(proposal.plan),
   ].filter(Boolean).join("\n");
   if (dryRun) {
-    ctx.ui.notify(`${preview}\nStatus: not-persisted (dry-run).`, "info");
+    ctx.ui.notify(`Dry-run succeeded for ${redactSensitiveText(proposal.target)}.\n${preview}\nStatus: not-persisted (dry-run).`, "info");
     return;
   }
   if (proposal.plan.changes.length === 0) {
-    ctx.ui.notify(`${preview}\nNo changes needed.\nStatus: not-persisted.`, "info");
+    ctx.ui.notify(`Add succeeded for ${redactSensitiveText(proposal.target)}: configuration is already up to date.\n${preview}\nNo changes needed.\nStatus: not-persisted.`, "info");
     return;
   }
   await requireAuthorization(ctx, flags, "add", preview);
@@ -361,7 +362,10 @@ async function runAdd(args: string[], flags: Record<string, string | boolean>, c
   const status = proposal.modelId
     ? await activateRuntime(ctx, doctor, [{ provider: proposal.providerId, model: proposal.modelId, present: true }])
     : "persisted-reload-required";
-  ctx.ui.notify(`${preview}\nStatus: ${statusMessage(status)}\nApplied. Backup: ${applied.backupPath ? redactSensitiveText(applied.backupPath) : "none (new file)"}`, status === "activation-failed" ? "warning" : "info");
+  const outcome = status === "activation-failed"
+    ? `Add was persisted for ${redactSensitiveText(proposal.target)}, but runtime activation failed.`
+    : `Add succeeded for ${redactSensitiveText(proposal.target)}.`;
+  ctx.ui.notify(`${outcome}\n${preview}\nStatus: ${statusMessage(status)}\nApplied. Backup: ${applied.backupPath ? redactSensitiveText(applied.backupPath) : "none (new file)"}`, status === "activation-failed" ? "warning" : "info");
 }
 
 async function runFix(args: string[], flags: Record<string, string | boolean>, ctx: ExtensionCommandContext, doctor: ModelDoctor): Promise<void> {

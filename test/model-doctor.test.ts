@@ -382,6 +382,69 @@ test("uses official model metadata for an unlisted third-party channel without r
   assert.equal((await readModelsJson(targetPaths.modelsPath)).data.providers?.[proposal.providerId]?.baseUrl, "https://third-party.example/v1");
 });
 
+test("automatically uses the official metadata provider for an unlisted channel", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-third-party-official-metadata-"));
+  const targetPaths = paths(root);
+  await writeFile(targetPaths.modelsPath, JSON.stringify({
+    providers: {
+      wong: {
+        baseUrl: "https://wong.example/v1",
+        api: "openai-completions",
+        apiKey: "$WONG_API_KEY",
+        headers: { "user-agent": "keep" },
+        models: [],
+      },
+    },
+  }));
+  const duplicateCatalog = normalizeCatalog({
+    openai: {
+      id: "openai",
+      npm: "@ai-sdk/openai",
+      api: "https://api.openai.com/v1",
+      models: { "gpt-official": { id: "gpt-official", limit: { context: 200000 } } },
+    },
+    gateway: {
+      id: "gateway",
+      npm: "@ai-sdk/openai-compatible",
+      api: "https://gateway.example/v1",
+      models: {
+        "gpt-official": {
+          id: "gpt-official",
+          provider: { npm: "@ai-sdk/openai" },
+          limit: { context: 100000 },
+        },
+      },
+    },
+  });
+  const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(duplicateCatalog) } });
+  const proposal = await doctor.proposeAdd({ target: "wong", modelId: "gpt-official", persistCache: false });
+  assert.equal(proposal.metadataProviderId, "openai");
+  assert.equal(proposal.matchedBy.includes("official-metadata-provider"), true);
+  assert.equal(proposal.config.providers?.wong?.models?.[0]?.contextWindow, 200000);
+  assert.equal(proposal.config.providers?.wong?.baseUrl, "https://wong.example/v1");
+  assert.equal(proposal.config.providers?.wong?.apiKey, "$WONG_API_KEY");
+  assert.deepEqual(proposal.config.providers?.wong?.headers, { "user-agent": "keep" });
+
+  const implicitCatalog = normalizeCatalog({
+    anthropic: {
+      id: "anthropic",
+      npm: "@ai-sdk/anthropic",
+      api: "https://api.anthropic.com",
+      models: { "claude-official": { id: "claude-official", limit: { context: 300000 } } },
+    },
+    gateway: {
+      id: "gateway",
+      npm: "@ai-sdk/openai-compatible",
+      api: "https://gateway.example/v1",
+      models: { "claude-official": { id: "claude-official", limit: { context: 100000 } } },
+    },
+  });
+  const implicitDoctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(implicitCatalog) } });
+  const implicit = await implicitDoctor.proposeAdd({ target: "wong", modelId: "claude-official", persistCache: false });
+  assert.equal(implicit.metadataProviderId, "anthropic");
+  assert.equal(implicit.config.providers?.wong?.models?.[0]?.contextWindow, 300000);
+});
+
 test("requires an explicit metadata provider when a third-party model id is ambiguous", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-third-party-ambiguous-"));
   const targetPaths = paths(root);
@@ -856,8 +919,8 @@ test("cache writes atomically, stores policy schema, and falls back to valid cac
   assert.match(result.warning ?? "", /cached catalog/);
 });
 
-test("boolean interleaved metadata does not block unrelated model discovery and remains valid in cache", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-boolean-interleaved-"));
+test("current models.dev metadata does not block unrelated model discovery and remains valid in cache", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-current-metadata-"));
   const targetPaths = paths(root);
   const rawCatalog = {
     wong: {
@@ -875,17 +938,85 @@ test("boolean interleaved metadata does not block unrelated model discovery and 
         },
       },
     },
+    nvidia: {
+      id: "nvidia",
+      models: {
+        "nvidia/active-speaker-detection": {
+          id: "nvidia/active-speaker-detection",
+          limit: { context: 0, output: 4096 },
+        },
+        "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning": {
+          id: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+          reasoning: true,
+          reasoning_options: [{ type: "toggle" }, { type: "budget_tokens", min: -1, max: 32768 }],
+        },
+      },
+    },
+    "google-vertex": {
+      id: "google-vertex",
+      models: {
+        "gemini-2.5-flash": {
+          id: "gemini-2.5-flash",
+          reasoning: true,
+          reasoning_options: [{ type: "toggle" }, { type: "budget_tokens", min: 0, max: 24576 }],
+        },
+      },
+    },
+    lynkr: {
+      id: "lynkr",
+      api: "http://127.0.0.1:8081/v1",
+      models: { "lynkr-auto": { id: "lynkr-auto" } },
+    },
+    sarvam: {
+      id: "sarvam",
+      models: {
+        "sarvam-105b": {
+          id: "sarvam-105b",
+          reasoning: true,
+          reasoning_options: [{ type: "effort", values: [null, "low", "medium", "high"] }],
+        },
+      },
+    },
+    "302ai": {
+      id: "302ai",
+      env: ["302AI_API_KEY"],
+      models: { "gpt-test": { id: "gpt-test" } },
+    },
+    edenai: {
+      id: "edenai",
+      models: {
+        "flexai/DeepSeek-V4-Flash-0731": { id: "flexai/DeepSeek-V4-Flash-0731" },
+        "flexai/deepseek-v4-flash-0731": { id: "flexai/deepseek-v4-flash-0731" },
+      },
+    },
   };
   const online = new ModelsDevClient(new CacheStore(targetPaths), { fetchImpl: fetchMock(rawCatalog) });
   const loaded = await online.load({ force: true });
   assert.equal(loaded.source, "network");
   assert.equal(ModelsDevClient.find(loaded.catalog, "wong", "gpt-5.6-sol")?.model?.id, "gpt-5.6-sol");
   assert.equal(loaded.catalog.providers["cloudflare-workers-ai"].models["@cf/nvidia/nemotron-3-120b-a12b"].interleaved, true);
+  assert.deepEqual(loaded.catalog.providers.nvidia.models["nvidia/active-speaker-detection"].limit, { context: 0, output: 4096 });
+  assert.deepEqual(loaded.catalog.providers.nvidia.models["nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"].reasoning_options, [{ type: "toggle" }, { type: "budget_tokens", min: -1, max: 32768 }]);
+  assert.deepEqual(loaded.catalog.providers["google-vertex"].models["gemini-2.5-flash"].reasoning_options, [{ type: "toggle" }, { type: "budget_tokens", min: 0, max: 24576 }]);
+  assert.equal(loaded.catalog.providers.lynkr.api, "http://127.0.0.1:8081/v1");
+  assert.deepEqual(loaded.catalog.providers.sarvam.models["sarvam-105b"].reasoning_options, [{ type: "effort", values: [null, "low", "medium", "high"] }]);
+  assert.deepEqual(loaded.catalog.providers["302ai"].env, ["302AI_API_KEY"]);
+  assert.equal(Object.keys(loaded.catalog.providers.edenai.models).length, 2);
+  assert.equal(ModelsDevClient.find(loaded.catalog, "edenai", "flexai/deepseek-v4-flash-0731")?.ambiguous, true);
 
   const cached = new ModelsDevClient(new CacheStore(targetPaths), { fetchImpl: (async () => { throw new Error("cache should be used"); }) as typeof fetch });
   const cachedResult = await cached.load();
   assert.equal(cachedResult.source, "cache");
+  assert.equal(ModelsDevClient.find(cachedResult.catalog, "wong", "gpt-5.6-sol")?.model?.id, "gpt-5.6-sol");
   assert.equal(cachedResult.catalog.providers["cloudflare-workers-ai"].models["@cf/nvidia/nemotron-3-120b-a12b"].interleaved, true);
+  assert.deepEqual(cachedResult.catalog.providers.nvidia.models["nvidia/active-speaker-detection"].limit, { context: 0, output: 4096 });
+  assert.deepEqual(cachedResult.catalog.providers.nvidia.models["nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"].reasoning_options, [{ type: "toggle" }, { type: "budget_tokens", min: -1, max: 32768 }]);
+  assert.deepEqual(cachedResult.catalog.providers["google-vertex"].models["gemini-2.5-flash"].reasoning_options, [{ type: "toggle" }, { type: "budget_tokens", min: 0, max: 24576 }]);
+  assert.equal(cachedResult.catalog.providers.lynkr.api, "http://127.0.0.1:8081/v1");
+  assert.deepEqual(cachedResult.catalog.providers.sarvam.models["sarvam-105b"].reasoning_options, [{ type: "effort", values: [null, "low", "medium", "high"] }]);
+  assert.deepEqual(cachedResult.catalog.providers["302ai"].env, ["302AI_API_KEY"]);
+  assert.equal(Object.keys(cachedResult.catalog.providers.edenai.models).length, 2);
+  assert.equal(ModelsDevClient.find(cachedResult.catalog, "edenai", "flexai/deepseek-v4-flash-0731")?.ambiguous, true);
 });
 
 test("refresh uses conditional headers and reports configuration findings without writing models.json", async () => {
@@ -1455,6 +1586,35 @@ test("interactive add selects a candidate instead of silently taking the first m
   assert.equal(notifications.some((message) => /Applied/.test(message)), true);
 });
 
+test("add command reports successful dry-runs and metadata-provider selection", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-add-success-notice-"));
+  const targetPaths = paths(root);
+  await writeFile(targetPaths.modelsPath, JSON.stringify({
+    providers: { wong: { baseUrl: "https://wong.example/v1", api: "openai-completions", models: [] } },
+  }));
+  const duplicateCatalog = normalizeCatalog({
+    openai: {
+      id: "openai",
+      npm: "@ai-sdk/openai",
+      api: "https://api.openai.com/v1",
+      models: { "gpt-official": { id: "gpt-official" } },
+    },
+    gateway: {
+      id: "gateway",
+      npm: "@ai-sdk/openai-compatible",
+      api: "https://gateway.example/v1",
+      models: { "gpt-official": { id: "gpt-official", provider: { npm: "@ai-sdk/openai" } } },
+    },
+  });
+  const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(duplicateCatalog) } });
+  const notifications: string[] = [];
+  const ctx = { hasUI: false, ui: { notify: (message: string) => notifications.push(message) } } as never;
+  await runCommand("add wong gpt-official --dry-run", ctx, doctor);
+  assert.match(notifications.at(-1) ?? "", /Dry-run succeeded for wong\/gpt-official/);
+  assert.match(notifications.at(-1) ?? "", /Metadata provider: openai/);
+  assert.match(notifications.at(-1) ?? "", /not-persisted \(dry-run\)/);
+});
+
 test("successful default-path mutations refresh and verify the active model registry", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-runtime-active-"));
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -1645,11 +1805,33 @@ test("catalog normalization preserves non-secret token metadata and strips crede
   assert.throws(() => normalizeCatalog({ test: { id: "test", api: "https://example.test/v1?api_key=secret", models: {} } }), (error: unknown) => error instanceof ModelsDevError && error.code === "invalid-catalog");
   assert.throws(() => normalizeCatalog({ test: { id: "test", api: "https://user:pass@example.test/v1", models: {} } }), (error: unknown) => error instanceof ModelsDevError && error.code === "invalid-catalog");
   assert.throws(() => normalizeCatalog({ test: { id: "test", api: "https://[::1]/v1", models: {} } }), (error: unknown) => error instanceof ModelsDevError && error.code === "invalid-catalog");
+  assert.throws(() => normalizeCatalog({ test: { id: "test", api: "http://10.0.0.1/v1", models: {} } }), (error: unknown) => error instanceof ModelsDevError && error.code === "invalid-catalog");
+  assert.throws(() => normalizeCatalog({ test: { id: "test", api: "http://public.example/v1", models: {} } }), (error: unknown) => error instanceof ModelsDevError && error.code === "invalid-catalog");
+  for (const env of [["lowercase_key"], ["INVALID-KEY"], [""], ["WITH SPACE"]]) {
+    assert.throws(() => normalizeCatalog({ test: { id: "test", env, models: {} } }), (error: unknown) => error instanceof ModelsDevError && error.code === "invalid-catalog");
+  }
   assert.throws(() => normalizeCatalog({ test: { id: "test", models: { model: { id: "MODEL" } } } }), (error: unknown) => error instanceof ModelsDevError && error.code === "invalid-catalog");
   assert.throws(() => normalizeCatalog({ test: { id: "test", models: { model: { id: "model", reasoning_options: [{ type: "budget", min: 10, max: 5 }] } } } }), (error: unknown) => error instanceof ModelsDevError && error.code === "invalid-catalog");
+  for (const option of [
+    { type: "budget", min: -1, max: 32768 },
+    { type: "budget_tokens", min: -2, max: 32768 },
+    { type: "budget_tokens", min: -1, max: 0 },
+    { type: "effort", values: [false, "low"] },
+  ]) {
+    assert.throws(
+      () => normalizeCatalog({ test: { id: "test", models: { model: { id: "model", reasoning_options: [option] } } } }),
+      (error: unknown) => error instanceof ModelsDevError && error.code === "invalid-catalog",
+    );
+  }
   for (const interleaved of [1, "enabled"]) {
     assert.throws(
       () => normalizeCatalog({ test: { id: "test", models: { model: { id: "model", interleaved } } } }),
+      (error: unknown) => error instanceof ModelsDevError && error.code === "invalid-catalog",
+    );
+  }
+  for (const limit of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, "4096"]) {
+    assert.throws(
+      () => normalizeCatalog({ test: { id: "test", models: { model: { id: "model", limit: { context: limit } } } } }),
       (error: unknown) => error instanceof ModelsDevError && error.code === "invalid-catalog",
     );
   }

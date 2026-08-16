@@ -289,6 +289,14 @@ export class ModelsDevClient {
     const bestScore = matches[0]?.score ?? 0;
     const bestMatches = matches.filter((match) => match.score === bestScore);
     if (bestMatches.length > 1) {
+      const official = metadataProvider ? undefined : selectOfficialMetadataMatch(bestMatches);
+      if (official) {
+        return {
+          ...official,
+          metadataOnly: true,
+          matchedBy: [...official.matchedBy, "official-metadata-provider", "metadata-only"],
+        };
+      }
       return {
         provider: bestMatches[0].provider,
         score: bestScore,
@@ -436,9 +444,8 @@ export function normalizeCatalog(raw: unknown, now = new Date()): ModelsDevCatal
       for (const [modelId, rawModel] of Object.entries(rawModels)) {
           if (!isRecord(rawModel)) throw new ModelsDevError(`models.dev provider ${providerId} contains an invalid model ${modelId}`, "invalid-catalog");
         if (isUnsafeCatalogKey(modelId)) throw new ModelsDevError(`models.dev provider ${providerId} contains an unsafe model key`, "invalid-catalog");
-        const normalizedId = normalizeKey(modelId);
-        if (seenModelIds.has(normalizedId)) throw new ModelsDevError(`models.dev provider ${providerId} contains duplicate model ${modelId}`, "invalid-catalog");
-        seenModelIds.add(normalizedId);
+        if (seenModelIds.has(modelId)) throw new ModelsDevError(`models.dev provider ${providerId} contains duplicate model ${modelId}`, "invalid-catalog");
+        seenModelIds.add(modelId);
         models[modelId] = normalizeModel(modelId, rawModel, providerId);
       }
     } else if (Array.isArray(rawModels)) {
@@ -447,9 +454,8 @@ export function normalizeCatalog(raw: unknown, now = new Date()): ModelsDevCatal
           throw new ModelsDevError(`models.dev provider ${providerId} contains an invalid model`, "invalid-catalog");
         }
         if (isUnsafeCatalogKey(rawModel.id)) throw new ModelsDevError(`models.dev provider ${providerId} contains an unsafe model key`, "invalid-catalog");
-        const normalizedId = normalizeKey(rawModel.id);
-        if (seenModelIds.has(normalizedId)) throw new ModelsDevError(`models.dev provider ${providerId} contains duplicate model ${rawModel.id}`, "invalid-catalog");
-        seenModelIds.add(normalizedId);
+        if (seenModelIds.has(rawModel.id)) throw new ModelsDevError(`models.dev provider ${providerId} contains duplicate model ${rawModel.id}`, "invalid-catalog");
+        seenModelIds.add(rawModel.id);
         models[rawModel.id] = normalizeModel(rawModel.id, rawModel, providerId);
       }
     }
@@ -480,7 +486,7 @@ function normalizeModel(id: string, rawModel: JsonRecord, providerId: string): M
     if (!isRecord(safeModel.limit)) throw new ModelsDevError(`models.dev model ${providerId}/${id} has invalid limits`, "invalid-catalog");
     for (const key of ["context", "output"] as const) {
       const limit = safeModel.limit[key];
-      if (limit !== undefined && !isPositiveInteger(limit)) throw new ModelsDevError(`models.dev model ${providerId}/${id} has invalid ${key} limit`, "invalid-catalog");
+      if (limit !== undefined && !isNonNegativeInteger(limit)) throw new ModelsDevError(`models.dev model ${providerId}/${id} has invalid ${key} limit`, "invalid-catalog");
     }
   }
   if (safeModel.cost !== undefined) {
@@ -568,10 +574,12 @@ function stripSensitiveCatalogFields(value: JsonRecord): JsonRecord {
 function isValidReasoningOption(value: unknown): value is JsonRecord {
   if (!isRecord(value)) return false;
   if (value.type !== undefined && (typeof value.type !== "string" || value.type.trim() === "")) return false;
-  if (value.values !== undefined && (!Array.isArray(value.values) || !value.values.every((item) => typeof item === "string" && item.trim() !== ""))) return false;
-  if (value.min !== undefined && (typeof value.min !== "number" || !Number.isFinite(value.min) || !Number.isInteger(value.min) || value.min <= 0)) return false;
+  if (value.values !== undefined && (!Array.isArray(value.values) || !value.values.every((item) => item === null || typeof item === "string" && item.trim() !== ""))) return false;
+  const type = typeof value.type === "string" ? value.type.toLowerCase() : undefined;
+  const sentinelMinimum = type === "budget_tokens" && (value.min === -1 || value.min === 0);
+  if (value.min !== undefined && !sentinelMinimum && (typeof value.min !== "number" || !Number.isFinite(value.min) || !Number.isInteger(value.min) || value.min <= 0)) return false;
   if (value.max !== undefined && (typeof value.max !== "number" || !Number.isFinite(value.max) || !Number.isInteger(value.max) || value.max <= 0)) return false;
-  if (typeof value.min === "number" && typeof value.max === "number" && value.min > value.max) return false;
+  if (typeof value.min === "number" && value.min > 0 && typeof value.max === "number" && value.min > value.max) return false;
   return true;
 }
 
@@ -611,14 +619,14 @@ function stringArray(value: unknown): string[] | undefined {
 }
 
 function isEnvironmentVariableName(value: unknown): value is string {
-  return typeof value === "string" && /^[A-Z][A-Z0-9_]*$/.test(value);
+  return typeof value === "string" && /^[A-Z0-9][A-Z0-9_]*$/.test(value);
 }
 
 function normalizeReasoningOptions(value: unknown): ModelsDevModel["reasoning_options"] {
   if (!Array.isArray(value)) return undefined;
   return value.filter(isRecord).map((option) => ({
     ...(typeof option.type === "string" ? { type: option.type } : {}),
-    ...(Array.isArray(option.values) ? { values: option.values.filter((item): item is string => typeof item === "string") } : {}),
+    ...(Array.isArray(option.values) ? { values: option.values.filter((item): item is string | null => item === null || typeof item === "string") } : {}),
     ...(numberOrUndefined(option.min) !== undefined ? { min: numberOrUndefined(option.min) } : {}),
     ...(numberOrUndefined(option.max) !== undefined ? { max: numberOrUndefined(option.max) } : {}),
   }));
@@ -744,7 +752,8 @@ function validateCatalogApiUrl(value: string, providerId: string): void {
   } catch (error) {
     throw new ModelsDevError(`models.dev provider ${providerId} has invalid API URL: ${errorMessage(error)}`, "invalid-catalog", error);
   }
-  if (parsed.protocol !== "https:" || parsed.username || parsed.password || isPrivateHost(parsed.hostname)) {
+  const loopbackHttp = parsed.protocol === "http:" && isLoopbackHost(parsed.hostname);
+  if ((parsed.protocol !== "https:" && !loopbackHttp) || parsed.username || parsed.password || (isPrivateHost(parsed.hostname) && !loopbackHttp)) {
     throw new ModelsDevError(`models.dev provider ${providerId} has an unsafe API URL`, "invalid-catalog");
   }
   validateNoCredentialQuery(parsed, `models.dev provider ${providerId} API URL`);
@@ -776,6 +785,24 @@ function globalModelMatches(catalog: ModelsDevCatalog, modelId: string, metadata
     }
   }
   return sortProviderMatches(matches);
+}
+
+function selectOfficialMetadataMatch(matches: ProviderMatch[]): ProviderMatch | undefined {
+  const officialMatches = matches.filter((match) => {
+    const providerPackage = match.provider.npm;
+    if (typeof providerPackage !== "string") return false;
+    const packageMatch = /^@ai-sdk\/([a-z0-9-]+)$/u.exec(providerPackage);
+    return packageMatch !== null && normalize(match.provider.id) === normalize(packageMatch[1]);
+  });
+  const declaredProviderPackages = new Set(matches.flatMap((match) => {
+    const metadata = match.model?.provider;
+    return isRecord(metadata) && typeof metadata.npm === "string" ? [metadata.npm] : [];
+  }));
+  const declaredOfficialMatches = declaredProviderPackages.size > 0
+    ? officialMatches.filter((match) => declaredProviderPackages.has(match.provider.npm ?? ""))
+    : [];
+  if (declaredOfficialMatches.length === 1) return declaredOfficialMatches[0];
+  return declaredProviderPackages.size === 0 && officialMatches.length === 1 ? officialMatches[0] : undefined;
 }
 
 function allCatalogMatches(catalog: ModelsDevCatalog, metadataProvider?: string): ProviderMatch[] {
@@ -854,7 +881,7 @@ function isCatalog(value: unknown): value is ModelsDevCatalog {
     const providerId = normalizeKey(provider.id);
     if (seenProviders.has(providerId)) return false;
     seenProviders.add(providerId);
-    return Object.entries(provider.models).every(([modelKey, model]) => !isUnsafeCatalogKey(modelKey) && !isUnsafeCatalogKey(model.id) && normalizeKey(modelKey) === normalizeKey(model.id));
+    return Object.entries(provider.models).every(([modelKey, model]) => !isUnsafeCatalogKey(modelKey) && !isUnsafeCatalogKey(model.id) && modelKey === model.id);
   });
 }
 
@@ -881,8 +908,8 @@ function isNormalizedModel(value: unknown): value is ModelsDevModel {
     || (value.modalities.input !== undefined && (!Array.isArray(value.modalities.input) || !value.modalities.input.every((item) => typeof item === "string")))
     || (value.modalities.output !== undefined && (!Array.isArray(value.modalities.output) || !value.modalities.output.every((item) => typeof item === "string"))))) return false;
   if (value.limit !== undefined && (!isRecord(value.limit)
-    || (value.limit.context !== undefined && !isPositiveInteger(value.limit.context))
-    || (value.limit.output !== undefined && !isPositiveInteger(value.limit.output)))) return false;
+    || (value.limit.context !== undefined && !isNonNegativeInteger(value.limit.context))
+    || (value.limit.output !== undefined && !isNonNegativeInteger(value.limit.output)))) return false;
   if (value.cost !== undefined) {
     if (!isRecord(value.cost)) return false;
     for (const key of ["input", "output", "cache_read", "cache_write"] as const) {
@@ -896,8 +923,8 @@ function isNormalizedModel(value: unknown): value is ModelsDevModel {
   return true;
 }
 
-function isPositiveInteger(value: unknown): value is number {
-  return typeof value === "number" && Number.isInteger(value) && Number.isFinite(value) && value > 0;
+function isNonNegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && Number.isFinite(value) && value >= 0;
 }
 
 function safeResponseValidator(value: string | null, label: string): string | undefined {
@@ -912,10 +939,11 @@ function isSafeCachedApiUrl(value: string): boolean {
   if (!looksLikeUrl(value)) return true;
   try {
     const parsed = new URL(value);
-    return parsed.protocol === "https:"
+    const loopbackHttp = parsed.protocol === "http:" && isLoopbackHost(parsed.hostname);
+    return (parsed.protocol === "https:" || loopbackHttp)
       && !parsed.username
       && !parsed.password
-      && !isPrivateHost(parsed.hostname)
+      && (!isPrivateHost(parsed.hostname) || loopbackHttp)
       && [...parsed.searchParams.keys()].every((key) => !isSensitiveCatalogKey(key));
   } catch {
     return false;
