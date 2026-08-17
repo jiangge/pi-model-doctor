@@ -1,5 +1,5 @@
-import { isIP } from "node:net";
 import { CacheStore } from "./cache.ts";
+import { isLoopbackHost, isPrivateHost, isSafeProviderApiUrl } from "./catalog-url.ts";
 import { errorMessage, isRecord, isSafeHeaderName, looksLikeCredentialValue, redactSensitiveText } from "./json.ts";
 import { capabilityCompat, defaultPolicyCatalog, detectPiApi, inferProviderEndpoint, resolveCache, resolveProviderAdapter, resolveReasoning } from "./capabilities.ts";
 import {
@@ -421,6 +421,7 @@ export function normalizeCatalog(raw: unknown, now = new Date()): ModelsDevCatal
   const seenProviderIds = new Set<string>();
   for (const [providerId, value] of providerEntries) {
     if (!isRecord(value)) throw new ModelsDevError(`models.dev provider ${providerId} must be an object`, "invalid-catalog");
+    if (hasUnsafeCatalogKeys(value)) throw new ModelsDevError(`models.dev provider ${providerId} uses an unsafe object key`, "invalid-catalog");
     if (!providerId.trim()) throw new ModelsDevError("models.dev provider id must not be empty", "invalid-catalog");
     if (isUnsafeCatalogKey(providerId)) throw new ModelsDevError(`models.dev provider ${providerId} uses an unsafe catalog key`, "invalid-catalog");
     const safeProvider = stripSensitiveCatalogFields(value);
@@ -430,7 +431,7 @@ export function normalizeCatalog(raw: unknown, now = new Date()): ModelsDevCatal
     seenProviderIds.add(normalizeKey(providerId));
     if (safeProvider.name !== undefined && typeof safeProvider.name !== "string") throw new ModelsDevError(`models.dev provider ${providerId} has invalid name`, "invalid-catalog");
     if (safeProvider.api !== undefined && typeof safeProvider.api !== "string") throw new ModelsDevError(`models.dev provider ${providerId} has invalid api`, "invalid-catalog");
-    if (typeof safeProvider.api === "string" && looksLikeUrl(safeProvider.api)) validateCatalogApiUrl(safeProvider.api, providerId);
+    if (typeof safeProvider.api === "string") validateCatalogApiUrl(safeProvider.api, providerId);
     if (safeProvider.env !== undefined && (!Array.isArray(safeProvider.env) || !safeProvider.env.every((item) => isEnvironmentVariableName(item)))) throw new ModelsDevError(`models.dev provider ${providerId} has invalid env metadata`, "invalid-catalog");
     if (safeProvider.required_headers !== undefined && (!Array.isArray(safeProvider.required_headers) || !safeProvider.required_headers.every((item) => isSafeHeaderName(item)))) throw new ModelsDevError(`models.dev provider ${providerId} has invalid required headers`, "invalid-catalog");
     if (!isOptionalMetadataObject(safeProvider.retention) || !isOptionalMetadataObject(safeProvider.usage) || !isOptionalSessionAffinity(safeProvider.session_affinity)) throw new ModelsDevError(`models.dev provider ${providerId} has invalid cache metadata`, "invalid-catalog");
@@ -575,8 +576,10 @@ function isValidReasoningOption(value: unknown): value is JsonRecord {
   if (!isRecord(value)) return false;
   if (value.type !== undefined && (typeof value.type !== "string" || value.type.trim() === "")) return false;
   if (value.values !== undefined && (!Array.isArray(value.values) || !value.values.every((item) => item === null || typeof item === "string" && item.trim() !== ""))) return false;
-  const type = typeof value.type === "string" ? value.type.toLowerCase() : undefined;
-  const sentinelMinimum = type === "budget_tokens" && (value.min === -1 || value.min === 0);
+  // The upstream sentinel is defined for the exact `budget_tokens` option;
+  // do not extend that exception to differently-cased or otherwise unknown
+  // option types.
+  const sentinelMinimum = value.type === "budget_tokens" && (value.min === -1 || value.min === 0);
   if (value.min !== undefined && !sentinelMinimum && (typeof value.min !== "number" || !Number.isFinite(value.min) || !Number.isInteger(value.min) || value.min <= 0)) return false;
   if (value.max !== undefined && (typeof value.max !== "number" || !Number.isFinite(value.max) || !Number.isInteger(value.max) || value.max <= 0)) return false;
   if (typeof value.min === "number" && value.min > 0 && typeof value.max === "number" && value.min > value.max) return false;
@@ -690,73 +693,10 @@ function validateCatalogEndpoint(value: string, trustedEndpoint = false): string
   return parsed.toString();
 }
 
-function isLoopbackHost(hostname: string): boolean {
-  const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  if (host === "localhost" || host === "127.0.0.1" || host === "::1" || isExpandedIpv6Loopback(host)) return true;
-  const mapped = ipv4MappedHost(host);
-  if (mapped) return isLoopbackHost(mapped);
-  return isIP(host) === 4 && host === "127.0.0.1";
-}
-
-function isPrivateHost(hostname: string): boolean {
-  const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  if (isLoopbackHost(host)) return true;
-  const mapped = ipv4MappedHost(host);
-  if (mapped) return isPrivateHost(mapped);
-  if (isIP(host) === 6) {
-    const firstHex = Number.parseInt(host.slice(0, 4), 16);
-    return host === "::"
-      || host.startsWith("fc")
-      || host.startsWith("fd")
-      || host.startsWith("ff")
-      || (firstHex >= 0xfe80 && firstHex <= 0xfebf);
-  }
-  const octets = host.split(".").map((part) => Number(part));
-  if (octets.length !== 4 || octets.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return false;
-  return octets[0] === 0
-    || octets[0] === 10
-    || octets[0] === 127
-    || (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31)
-    || (octets[0] === 192 && octets[1] === 168)
-    || (octets[0] === 169 && octets[1] === 254);
-}
-
-function isExpandedIpv6Loopback(host: string): boolean {
-  if (isIP(host) !== 6 || !host.includes(":")) return false;
-  const halves = host.split("::");
-  if (halves.length > 2) return false;
-  const left = halves[0] ? halves[0].split(":") : [];
-  const right = halves.length === 2 && halves[1] ? halves[1].split(":") : [];
-  const missing = halves.length === 2 ? 8 - left.length - right.length : 0;
-  if (missing < 0 || (halves.length === 1 && left.length !== 8)) return false;
-  const groups = [...left, ...Array.from({ length: missing }, () => "0"), ...right];
-  if (groups.length !== 8 || groups.some((group) => !/^[0-9a-f]{1,4}$/i.test(group))) return false;
-  return groups.slice(0, 7).every((group) => Number.parseInt(group, 16) === 0) && Number.parseInt(groups[7], 16) === 1;
-}
-
-function ipv4MappedHost(host: string): string | undefined {
-  if (!host.startsWith("::ffff:")) return undefined;
-  const tail = host.slice("::ffff:".length);
-  if (tail.includes(".")) return tail;
-  const groups = tail.split(":");
-  if (groups.length !== 2 || groups.some((group) => !/^[0-9a-f]{1,4}$/i.test(group))) return undefined;
-  const high = Number.parseInt(groups[0], 16);
-  const low = Number.parseInt(groups[1], 16);
-  return `${high >>> 8}.${high & 0xff}.${low >>> 8}.${low & 0xff}`;
-}
-
 function validateCatalogApiUrl(value: string, providerId: string): void {
-  let parsed: URL;
-  try {
-    parsed = new URL(value);
-  } catch (error) {
-    throw new ModelsDevError(`models.dev provider ${providerId} has invalid API URL: ${errorMessage(error)}`, "invalid-catalog", error);
-  }
-  const loopbackHttp = parsed.protocol === "http:" && isLoopbackHost(parsed.hostname);
-  if ((parsed.protocol !== "https:" && !loopbackHttp) || parsed.username || parsed.password || (isPrivateHost(parsed.hostname) && !loopbackHttp)) {
+  if (!isSafeProviderApiUrl(value, isSensitiveCatalogKey)) {
     throw new ModelsDevError(`models.dev provider ${providerId} has an unsafe API URL`, "invalid-catalog");
   }
-  validateNoCredentialQuery(parsed, `models.dev provider ${providerId} API URL`);
 }
 
 function validateNoCredentialQuery(parsed: URL, label: string): void {
@@ -870,6 +810,12 @@ function isUnsafeCatalogKey(key: string): boolean {
   return key === "__proto__" || key === "constructor" || key === "prototype";
 }
 
+function hasUnsafeCatalogKeys(value: unknown): boolean {
+  if (Array.isArray(value)) return value.some(hasUnsafeCatalogKeys);
+  if (!isRecord(value)) return false;
+  return Object.entries(value).some(([key, child]) => isUnsafeCatalogKey(key) || hasUnsafeCatalogKeys(child));
+}
+
 function isCatalog(value: unknown): value is ModelsDevCatalog {
   if (!isRecord(value) || hasSensitiveCatalogKey(value) || value.schemaVersion !== 1 || !isRecord(value.providers) || Object.keys(value.providers).length === 0) return false;
   if (value.fetchedAt !== undefined && (typeof value.fetchedAt !== "string" || !Number.isFinite(Date.parse(value.fetchedAt)))) return false;
@@ -936,18 +882,7 @@ function safeResponseValidator(value: string | null, label: string): string | un
 }
 
 function isSafeCachedApiUrl(value: string): boolean {
-  if (!looksLikeUrl(value)) return true;
-  try {
-    const parsed = new URL(value);
-    const loopbackHttp = parsed.protocol === "http:" && isLoopbackHost(parsed.hostname);
-    return (parsed.protocol === "https:" || loopbackHttp)
-      && !parsed.username
-      && !parsed.password
-      && (!isPrivateHost(parsed.hostname) || loopbackHttp)
-      && [...parsed.searchParams.keys()].every((key) => !isSensitiveCatalogKey(key));
-  } catch {
-    return false;
-  }
+  return isSafeProviderApiUrl(value, isSensitiveCatalogKey);
 }
 
 function hasSensitiveCatalogKey(value: unknown, modelMap = false): boolean {

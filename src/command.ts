@@ -354,7 +354,7 @@ async function runAdd(args: string[], flags: Record<string, string | boolean>, c
     return;
   }
   if (proposal.plan.changes.length === 0) {
-    ctx.ui.notify(`Add succeeded for ${redactSensitiveText(proposal.target)}: configuration is already up to date.\n${preview}\nNo changes needed.\nStatus: not-persisted.`, "info");
+    ctx.ui.notify(`Add succeeded for ${redactSensitiveText(proposal.target)}: configuration is already up to date.\n${preview}\nNo changes needed.\nStatus: already-persisted (no write or backup was needed).`, "info");
     return;
   }
   await requireAuthorization(ctx, flags, "add", preview);

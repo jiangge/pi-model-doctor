@@ -997,7 +997,15 @@ test("current models.dev metadata does not block unrelated model discovery and r
   assert.equal(loaded.catalog.providers["cloudflare-workers-ai"].models["@cf/nvidia/nemotron-3-120b-a12b"].interleaved, true);
   assert.deepEqual(loaded.catalog.providers.nvidia.models["nvidia/active-speaker-detection"].limit, { context: 0, output: 4096 });
   assert.deepEqual(loaded.catalog.providers.nvidia.models["nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"].reasoning_options, [{ type: "toggle" }, { type: "budget_tokens", min: -1, max: 32768 }]);
+  const nvidiaReasoning = resolveReasoning(loaded.catalog.providers.nvidia, loaded.catalog.providers.nvidia.models["nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"]);
+  assert.equal(nvidiaReasoning.controlType, "unknown");
+  assert.equal(nvidiaReasoning.fallback, true);
+  assert.equal(nvidiaReasoning.budgetTokens, undefined);
   assert.deepEqual(loaded.catalog.providers["google-vertex"].models["gemini-2.5-flash"].reasoning_options, [{ type: "toggle" }, { type: "budget_tokens", min: 0, max: 24576 }]);
+  const googleReasoning = resolveReasoning(loaded.catalog.providers["google-vertex"], loaded.catalog.providers["google-vertex"].models["gemini-2.5-flash"]);
+  assert.equal(googleReasoning.controlType, "unknown");
+  assert.equal(googleReasoning.fallback, true);
+  assert.equal(googleReasoning.budgetTokens, undefined);
   assert.equal(loaded.catalog.providers.lynkr.api, "http://127.0.0.1:8081/v1");
   assert.deepEqual(loaded.catalog.providers.sarvam.models["sarvam-105b"].reasoning_options, [{ type: "effort", values: [null, "low", "medium", "high"] }]);
   assert.deepEqual(loaded.catalog.providers["302ai"].env, ["302AI_API_KEY"]);
@@ -1395,6 +1403,13 @@ test("add treats metadata-only provider/model churn as a no-op", async () => {
   assert.equal(proposal.plan.changes.length, 0);
   const applied = await doctor.applyAdd(proposal);
   assert.equal(applied.backupPath, undefined);
+  assert.equal((await readdir(root)).some((file) => file.startsWith("models.json.bak-")), false);
+
+  const notifications: string[] = [];
+  const ctx = { hasUI: false, ui: { notify: (message: string) => notifications.push(message) } } as never;
+  await runCommand("add openai gpt-test --yes", ctx, doctor);
+  assert.match(notifications.at(-1) ?? "", /Add succeeded.*already up to date/s);
+  assert.match(notifications.at(-1) ?? "", /already-persisted \(no write or backup was needed\)/);
   assert.equal((await readdir(root)).some((file) => file.startsWith("models.json.bak-")), false);
 });
 
@@ -1807,13 +1822,21 @@ test("catalog normalization preserves non-secret token metadata and strips crede
   assert.throws(() => normalizeCatalog({ test: { id: "test", api: "https://[::1]/v1", models: {} } }), (error: unknown) => error instanceof ModelsDevError && error.code === "invalid-catalog");
   assert.throws(() => normalizeCatalog({ test: { id: "test", api: "http://10.0.0.1/v1", models: {} } }), (error: unknown) => error instanceof ModelsDevError && error.code === "invalid-catalog");
   assert.throws(() => normalizeCatalog({ test: { id: "test", api: "http://public.example/v1", models: {} } }), (error: unknown) => error instanceof ModelsDevError && error.code === "invalid-catalog");
+  assert.throws(() => normalizeCatalog({ test: { id: "test", api: "ftp://public.example/v1", models: {} } }), (error: unknown) => error instanceof ModelsDevError && error.code === "invalid-catalog");
+  assert.throws(() => normalizeCatalog({ test: { id: "test", api: "javascript:alert(1)", models: {} } }), (error: unknown) => error instanceof ModelsDevError && error.code === "invalid-catalog");
+  assert.throws(() => normalizeCatalog({ test: { id: "test", api: " https://public.example/v1", models: {} } }), (error: unknown) => error instanceof ModelsDevError && error.code === "invalid-catalog");
+  assert.throws(() => normalizeCatalog({ test: { id: "test", api: "https://@public.example/v1", models: {} } }), (error: unknown) => error instanceof ModelsDevError && error.code === "invalid-catalog");
+  assert.doesNotThrow(() => normalizeCatalog({ test: { id: "test", api: "http://localhost.:8080/v1", models: {} } }));
   for (const env of [["lowercase_key"], ["INVALID-KEY"], [""], ["WITH SPACE"]]) {
     assert.throws(() => normalizeCatalog({ test: { id: "test", env, models: {} } }), (error: unknown) => error instanceof ModelsDevError && error.code === "invalid-catalog");
   }
   assert.throws(() => normalizeCatalog({ test: { id: "test", models: { model: { id: "MODEL" } } } }), (error: unknown) => error instanceof ModelsDevError && error.code === "invalid-catalog");
+  const unsafeCatalog = JSON.parse('{"test":{"id":"test","models":{"model":{"id":"model","retention":{"__proto__":{"enabled":true}}}}}}') as unknown;
+  assert.throws(() => normalizeCatalog(unsafeCatalog), (error: unknown) => error instanceof ModelsDevError && error.code === "invalid-catalog");
   assert.throws(() => normalizeCatalog({ test: { id: "test", models: { model: { id: "model", reasoning_options: [{ type: "budget", min: 10, max: 5 }] } } } }), (error: unknown) => error instanceof ModelsDevError && error.code === "invalid-catalog");
   for (const option of [
     { type: "budget", min: -1, max: 32768 },
+    { type: "BUDGET_TOKENS", min: -1, max: 32768 },
     { type: "budget_tokens", min: -2, max: 32768 },
     { type: "budget_tokens", min: -1, max: 0 },
     { type: "effort", values: [false, "low"] },
@@ -1947,6 +1970,15 @@ test("provider cache is versioned, complete, and rejects secret-bearing summarie
   assert.deepEqual(await doctor.cache.readProviderCache(), undefined);
   await writeFile(targetPaths.providersCachePath, JSON.stringify({ version: 1, fetchedAt: new Date().toISOString(), data: { schemaVersion: 1, providers: { openai: { id: "openai", adapter: "openai-compatible", capabilities: { prompt: false, context: false, kv: false, reasoning: false, reasoningControls: [], cacheSources: [], cacheConfidences: [], cacheSignals: [] }, nested: { x_api_key: "SECRET" } } } } }));
   assert.deepEqual(await doctor.cache.readProviderCache(), undefined);
+
+  const validCapabilities = { prompt: false, context: false, kv: false, reasoning: false, reasoningControls: [], cacheSources: [], cacheConfidences: [], cacheSignals: [] };
+  const cachePayload = (api: string) => ({ version: 1, fetchedAt: new Date().toISOString(), data: { schemaVersion: 1, providers: { local: { id: "local", api, adapter: "openai-compatible", capabilities: validCapabilities } } } });
+  await writeFile(targetPaths.providersCachePath, JSON.stringify(cachePayload("http://127.0.0.2:8080/v1")));
+  assert.equal((await doctor.cache.readProviderCache())?.providers.local.api, "http://127.0.0.2:8080/v1");
+  for (const api of ["http://10.0.0.1/v1", "http://public.example/v1", "ftp://public.example/v1", "javascript:alert(1)", " https://public.example/v1", "https://@public.example/v1", "https://user:pass@example.test/v1", "https://example.test/v1?api_key=secret"]) {
+    await writeFile(targetPaths.providersCachePath, JSON.stringify(cachePayload(api)));
+    assert.equal(await doctor.cache.readProviderCache(), undefined, `unsafe provider cache API should be rejected: ${api}`);
+  }
 });
 
 test("stale cache write locks are reclaimed safely", async () => {
