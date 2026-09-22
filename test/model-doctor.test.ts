@@ -7,7 +7,9 @@ import { formatFindings, parseCommandArgs, runCommand } from "../src/command.ts"
 import {
   capabilityCompat,
   defaultPolicyCatalog,
+  detectPiApi,
   endpointApiForModel,
+  inferApiFromModelName,
   normalizeEndpointForApi,
   resolveCache,
   resolveReasoning,
@@ -20,6 +22,7 @@ import modelDoctorExtension, { getModelDoctorRefreshIntervalMs } from "../index.
 import { discoverAndLoadExtensions } from "@earendil-works/pi-coding-agent";
 import { atomicWrite, canManageField, cleanupBackups, DoctorError, fileFingerprint, readModelsJson, redactSensitiveText, stripDoctorMetadata, writeModelsJson } from "../src/json.ts";
 import { ModelsDevClient, ModelsDevError, normalizeCatalog } from "../src/models-dev.ts";
+import { PI_API_OPTIONS } from "../src/types.ts";
 import type { DoctorPaths, ModelsDevCatalog, PiModelsJson } from "../src/types.ts";
 
 function catalog(): ModelsDevCatalog {
@@ -136,15 +139,20 @@ test("parses unified command arguments, migration flags, help, and unknown paths
     args: ["openai", "gpt-test"],
     flags: { "allow-literal-api-key": true, yes: true },
   });
-  assert.deepEqual(parseCommandArgs("add https://gateway.example/v1 model --metadata-provider anthropic --api anthropic-messages --dry-run"), {
+  assert.deepEqual(parseCommandArgs("add gateway https://gateway.example/v1 model --metadata-provider anthropic --api anthropic-messages --dry-run"), {
     command: "add",
-    args: ["https://gateway.example/v1", "model"],
+    args: ["gateway", "https://gateway.example/v1", "model"],
     flags: { "metadata-provider": "anthropic", api: "anthropic-messages", "dry-run": true },
   });
   assert.deepEqual(parseCommandArgs("add providerA https://gateway.example/v1 model --yes"), {
     command: "add",
     args: ["providerA", "https://gateway.example/v1", "model"],
     flags: { yes: true },
+  });
+  assert.deepEqual(parseCommandArgs("configure providerA https://gateway.example/v1 model --api google-vertex --api-key $GOOGLE_API_KEY --yes"), {
+    command: "configure",
+    args: ["providerA", "https://gateway.example/v1", "model"],
+    flags: { api: "google-vertex", "api-key": "$GOOGLE_API_KEY", yes: true },
   });
   assert.deepEqual(parseCommandArgs("sync openai --models gpt-one,gpt-two --yes"), {
     command: "sync",
@@ -153,6 +161,142 @@ test("parses unified command arguments, migration flags, help, and unknown paths
   });
   assert.deepEqual(parseCommandArgs("unknown"), { command: "invalid", args: ["unknown"], flags: {} });
   assert.equal(parseCommandArgs("").command, "help");
+});
+
+test("supports provider-id-first adds, weak API inference, and all Pi API choices", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-provider-id-first-"));
+  const targetPaths = paths(root);
+  const windhubCatalog = normalizeCatalog({
+    xai: {
+      id: "xai",
+      npm: "@ai-sdk/xai",
+      api: "https://api.x.ai/v1",
+      models: { "grok-4.6": { id: "grok-4.6", name: "Grok 4.6" } },
+    },
+  });
+  const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(windhubCatalog) } });
+  const notifications: string[] = [];
+  const ctx = { hasUI: false, ui: { notify: (message: string) => notifications.push(message) } } as never;
+
+  await runCommand("add windhub-gpt https://windhub.cc/v1/ grok-4.6 --api-key $WINDHUB_API_KEY --yes", ctx, doctor);
+  const saved = await readModelsJson(targetPaths.modelsPath);
+  const channel = saved.data.providers?.["windhub-gpt"];
+  assert.equal(channel?.baseUrl, "https://windhub.cc/v1/");
+  assert.equal(channel?.api, "openai-completions");
+  assert.equal(channel?.apiKey, "$WINDHUB_API_KEY");
+  assert.equal(channel?.models?.[0]?.id, "grok-4.6");
+  assert.match(notifications.at(-1) ?? "", /Add succeeded|Applied/);
+
+  await runCommand("add https://windhub.cc/v1/ grok-4.6 --dry-run", ctx, doctor);
+  assert.match(notifications.at(-1) ?? "", /provider-id.*URL-first syntax is not supported/i);
+
+  const configuredRoot = await mkdtemp(join(tmpdir(), "pi-model-doctor-provider-id-existing-"));
+  const configuredPaths = paths(configuredRoot);
+  await writeFile(configuredPaths.modelsPath, JSON.stringify({
+    providers: { configured: { baseUrl: "https://configured.example", apiKey: "$OLD_KEY", models: [{ id: "existing", api: "google-vertex" }] } },
+  }));
+  const configuredDoctor = new ModelDoctor({ paths: configuredPaths, fetcher: { fetchImpl: fetchMock(windhubCatalog) } });
+  await runCommand("add missing grok-4.6 --dry-run", ctx, configuredDoctor);
+  assert.match(notifications.at(-1) ?? "", /not configured.*endpoint-url/i);
+  await runCommand("add missing grok-4.6 --api unsupported --dry-run", ctx, configuredDoctor);
+  for (const api of PI_API_OPTIONS) assert.match(notifications.at(-1) ?? "", new RegExp(api));
+  await assert.rejects(
+    () => configuredDoctor.proposeAdd({ target: "missing", modelId: "grok-4.6", persistCache: false }),
+    (error: unknown) => error instanceof DoctorError && error.code === "invalid-target",
+  );
+  await runCommand("add configured grok-4.6 --yes", ctx, configuredDoctor);
+  const configured = (await readModelsJson(configuredPaths.modelsPath)).data.providers?.configured;
+  assert.equal(configured?.baseUrl, "https://configured.example");
+  assert.equal(configured?.api, undefined);
+  assert.equal(configured?.models?.find((model) => model.id === "grok-4.6")?.api, "google-vertex");
+  assert.equal(configured?.apiKey, "$OLD_KEY");
+
+  for (const api of PI_API_OPTIONS) {
+    const proposal = await doctor.proposeAdd({
+      target: "https://api.example",
+      providerId: `provider-${api}`,
+      modelId: "grok-4.6",
+      api,
+      persistCache: false,
+    });
+    assert.equal(proposal.config.providers?.[`provider-${api}`]?.api, api);
+  }
+});
+
+test("configure updates endpoint, credentials, and managed model APIs without replacing user fields", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-configure-"));
+  const targetPaths = paths(root);
+  const source = catalog();
+  const managedModel = toPiModel(source.providers.openai, source.providers.openai.models["gpt-test"], {
+    endpoint: "https://old.example/v1",
+    sourceName: "models.dev",
+    now: new Date("2026-08-01T00:00:00.000Z"),
+  });
+  // Exercise the no-value-change path: an explicit provider-wide choice must
+  // still be recorded when the managed model already has that API.
+  managedModel.api = "anthropic-messages";
+  if (managedModel._piModelDoctor?.managedValues) managedModel._piModelDoctor.managedValues.api = "anthropic-messages";
+  const userModel = { id: "manual", api: "openai-completions", custom: true };
+  await writeFile(targetPaths.modelsPath, JSON.stringify({
+    providers: {
+      gateway: {
+        baseUrl: "https://old.example/v1",
+        api: "openai-completions",
+        apiKey: "$OLD_KEY",
+        models: [managedModel, userModel],
+      },
+    },
+  }, null, 2));
+  const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(source) } });
+  const proposal = await doctor.proposeSetApi({
+    providerId: "gateway",
+    endpoint: "https://new.example/v1",
+    api: "anthropic-messages",
+    apiKey: "$NEW_KEY",
+  });
+  assert.deepEqual(proposal.modelIds, ["gpt-test", "manual"]);
+  assert.equal(proposal.config.providers?.gateway?.baseUrl, "https://new.example/v1");
+  assert.equal(proposal.config.providers?.gateway?.api, "anthropic-messages");
+  assert.equal(proposal.config.providers?.gateway?.models?.find((model) => model.id === "gpt-test")?.api, "anthropic-messages");
+  assert.equal(proposal.config.providers?.gateway?.models?.find((model) => model.id === "manual")?.api, "openai-completions");
+  assert.equal(proposal.config.providers?.gateway?.apiKey, "$NEW_KEY");
+  await doctor.applySetApi(proposal);
+  const saved = (await readModelsJson(targetPaths.modelsPath)).data.providers?.gateway;
+  assert.equal(saved?.baseUrl, "https://new.example/v1");
+  assert.equal(saved?.api, "anthropic-messages");
+  assert.equal(saved?.apiKey, "$NEW_KEY");
+  assert.equal(saved?.models?.find((model) => model.id === "gpt-test")?.api, "anthropic-messages");
+  assert.equal(saved?.models?.find((model) => model.id === "manual")?.api, "openai-completions");
+  // Provider-wide configure keeps managed model APIs managed (continuous sync):
+  // the api stays in managedFields and the managed snapshot is refreshed.
+  assert.equal(saved?.models?.find((model) => model.id === "gpt-test")?._piModelDoctor?.managedFields?.includes("api"), true);
+  assert.equal(saved?.models?.find((model) => model.id === "gpt-test")?._piModelDoctor?.managedValues?.api, "anthropic-messages");
+  assert.equal(saved?.models?.find((model) => model.id === "gpt-test")?._piModelDoctor?.explicitFields?.includes("api"), true);
+
+  const notifications: string[] = [];
+  const ctx = { hasUI: false, ui: { notify: (message: string) => notifications.push(message) } } as never;
+  await runCommand("configure gateway --api google-vertex --dry-run", ctx, doctor);
+  assert.match(notifications.at(-1) ?? "", /Dry-run succeeded.*not-persisted/s);
+  assert.equal((await readModelsJson(targetPaths.modelsPath)).data.providers?.gateway?.api, "anthropic-messages");
+  await runCommand("configure gateway --api google-vertex --yes", ctx, doctor);
+  assert.match(notifications.at(-1) ?? "", /Configure succeeded|Status: persisted/);
+  const changed = (await readModelsJson(targetPaths.modelsPath)).data.providers?.gateway;
+  assert.equal(changed?.api, "google-vertex");
+  // Continuous synchronization: the managed model API follows the provider on
+  // a later provider-wide configure instead of being frozen as user-owned.
+  assert.equal(changed?.models?.find((model) => model.id === "gpt-test")?.api, "google-vertex");
+  await runCommand("configure gateway --api google-vertex --yes", ctx, doctor);
+  assert.match(notifications.at(-1) ?? "", /already up to date|already-persisted/);
+
+  // The explicitly-set protocol is marked explicitFields: it stays managed for
+  // continuous sync but is individually protected from check/fix auto-reverts.
+  const explicit = (await readModelsJson(targetPaths.modelsPath)).data.providers?.gateway?.models?.find((m) => m.id === "gpt-test")?._piModelDoctor;
+  assert.equal(explicit?.explicitFields?.includes("api"), true);
+  assert.equal(explicit?.managedFields?.includes("api"), true);
+  // fix must not revert gpt-test.api back to the catalog openai-completions.
+  const fixResult = await doctor.proposeFix("gateway/gpt-test");
+  const apiChanges = (fixResult.result.plan?.changes ?? []).filter((change) => change.path.includes(".models[gpt-test].api") || change.path.endsWith("gpt-test.api"));
+  assert.deepEqual(apiChanges, []);
 });
 
 test("normalizes effort, budget, toggle, and unknown reasoning plus cache signals", () => {
@@ -239,6 +383,13 @@ test("resolves provider adapters and independent cache capabilities", () => {
   assert.ok((compat?.cacheWarnings?.length ?? 0) > 0);
   assert.equal(resolveProviderAdapter({ id: "deepseek", models: {} }).thinkingFormat, "deepseek");
   assert.equal(resolveProviderAdapter({ id: "google", models: {} }).id, "google");
+  // Adapter ids must round-trip to a registered policy, not silently degrade to
+  // the generic fallback while the adapter id still gates capability claims.
+  const mistralAdapter = resolveProviderAdapter({ id: "mistral", models: {} });
+  assert.equal(mistralAdapter.id, "openai-compatible");
+  assert.notEqual(defaultPolicyCatalog().adapters[mistralAdapter.id], undefined);
+  assert.equal(resolveProviderAdapter({ id: "bedrock", models: {} }).id, "fallback");
+  assert.equal(resolveProviderAdapter({ id: "pi-messages", models: {} }).id, "fallback");
   assert.equal(defaultPolicyCatalog().schemaVersion, 1);
   assert.equal(compat?.cacheCapabilities?.prompt, false);
   assert.equal(compat?.cacheCapabilities?.context, true);
@@ -279,7 +430,11 @@ test("normalizes custom channel endpoints from resolved API type", async () => {
   assert.equal(endpointApiForModel(richCatalog().providers.anthropic, "https://gateway.example"), "anthropic-messages");
   assert.equal(endpointApiForModel(richCatalog().providers.google, "https://gateway.example"), "google-generative-ai");
   assert.equal(endpointApiForModel(richCatalog().providers.anthropic, "https://gateway.example", "openai-completions"), "openai-completions");
-  assert.equal(endpointApiForModel(undefined, "https://gateway.example"), undefined);
+  assert.equal(endpointApiForModel(undefined, "https://gateway.example"), "openai-completions");
+  assert.equal(inferApiFromModelName("claude-3"), "anthropic-messages");
+  assert.equal(inferApiFromModelName("gemini-2.5"), "google-generative-ai");
+  assert.equal(inferApiFromModelName("gpt-5.6"), undefined);
+  assert.equal(detectPiApi({ id: "custom", api: "openai-completions", models: {} }, undefined, undefined, "claude-3"), "openai-completions");
 });
 
 test("adds or preserves channel URL versions from the resolved model API", async () => {
@@ -297,7 +452,7 @@ test("adds or preserves channel URL versions from the resolved model API", async
   assert.equal(anthropic.config.providers?.[anthropic.providerId]?.api, "anthropic-messages");
   const genericAnthropic = await anthropicDoctor.proposeAdd({ target: "https://custom-gateway.example", modelId: "claude-budget", persistCache: false });
   assert.equal(genericAnthropic.config.providers?.[genericAnthropic.providerId]?.baseUrl, "https://custom-gateway.example");
-  assert.equal(genericAnthropic.config.providers?.[genericAnthropic.providerId]?.api, "openai-completions");
+  assert.equal(genericAnthropic.config.providers?.[genericAnthropic.providerId]?.api, "anthropic-messages");
   const google = await anthropicDoctor.proposeAdd({ target: "https://custom-google-gateway.example", modelId: "gemini-budget", persistCache: false });
   assert.equal(google.config.providers?.[google.providerId]?.baseUrl, "https://custom-google-gateway.example");
 
@@ -350,7 +505,7 @@ test("rejects ambiguous model discovery instead of selecting a catalog entry", a
     anthropic: { id: "anthropic", models: { shared: { id: "shared", name: "Shared" } } },
   });
   const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(ambiguous) } });
-  await assert.rejects(() => doctor.proposeAdd({ target: "shared", persistCache: false }), (error: unknown) => error instanceof DoctorError && error.code === "selection-required");
+  await assert.rejects(() => doctor.proposeAdd({ target: "https://shared.example", modelId: "shared", persistCache: false }), (error: unknown) => error instanceof DoctorError && error.code === "selection-required");
 });
 
 test("uses official model metadata for an unlisted third-party channel without replacing transport fields", async () => {
@@ -1138,7 +1293,7 @@ test("policy cache is read and used by capability fallback resolution", async ()
   const cache = new CacheStore(targetPaths);
   await cache.writePolicyCatalog(policy);
   const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(richCatalog()) } });
-  const proposal = await doctor.proposeAdd({ target: "unknown", modelId: "unknown-thinking", persistCache: false });
+  const proposal = await doctor.proposeAdd({ target: "unknown", modelId: "unknown-thinking", requireConfiguredProvider: false, persistCache: false });
   assert.match((proposal.config.providers?.unknown?.models?.[0]?.compat?.reasoningWarnings ?? []).join(" "), /customFallbackPolicy/);
 });
 
@@ -1476,7 +1631,7 @@ test("dry-run add/remove does not write catalog cache or backups and backup name
   const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-dry-run-"));
   const targetPaths = paths(root);
   const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(catalog()) }, now: () => new Date("2026-08-01T00:00:00.000Z") });
-  await doctor.proposeAdd({ target: "openai", modelId: "gpt-test", dryRun: true, persistCache: false });
+  await doctor.proposeAdd({ target: "https://api.openai.com/v1", providerId: "openai", modelId: "gpt-test", dryRun: true, persistCache: false });
   await assert.rejects(() => readFile(targetPaths.modelsCachePath));
   await writeFile(targetPaths.modelsPath, JSON.stringify({ providers: { openai: { models: [{ id: "gpt-test" }] } } }));
   const removal = await doctor.proposeRemove("openai/gpt-test");
@@ -1586,6 +1741,7 @@ test("interactive migration selects a destination when --to is omitted", async (
 test("interactive add selects a candidate instead of silently taking the first model", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-select-"));
   const targetPaths = paths(root);
+  await writeFile(targetPaths.modelsPath, JSON.stringify({ providers: { openai: { baseUrl: "https://api.openai.com/v1", models: [] } } }));
   const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(catalog()) } });
   const notifications: string[] = [];
   const ctx = {
@@ -1636,6 +1792,7 @@ test("successful default-path mutations refresh and verify the active model regi
   process.env.PI_CODING_AGENT_DIR = root;
   try {
     const targetPaths = paths(root);
+    await writeFile(targetPaths.modelsPath, JSON.stringify({ providers: { openai: { baseUrl: "https://api.openai.com/v1", models: [] } } }));
     const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(catalog()) } });
     const notifications: string[] = [];
     let refreshed = 0;
@@ -1662,6 +1819,7 @@ test("runtime verification failures are reported after persistence", async () =>
   process.env.PI_CODING_AGENT_DIR = root;
   try {
     const targetPaths = paths(root);
+    await writeFile(targetPaths.modelsPath, JSON.stringify({ providers: { openai: { baseUrl: "https://api.openai.com/v1", models: [] } } }));
     const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(catalog()) } });
     const notifications: string[] = [];
     const ctx = {
@@ -1684,7 +1842,7 @@ test("headless direct channel model add supports URL targets and explicit provid
   const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(catalog()) } });
   const notifications: string[] = [];
   const ctx = { hasUI: false, ui: { notify: (message: string) => notifications.push(message) } } as never;
-  await runCommand("add https://gateway.example/v1 gpt-test --yes", ctx, doctor);
+  await runCommand("add gateway https://gateway.example/v1 gpt-test --yes", ctx, doctor);
   const saved = await readModelsJson(targetPaths.modelsPath);
   assert.equal(saved.data.providers?.gateway?.baseUrl, "https://gateway.example/v1");
   assert.equal(saved.data.providers?.gateway?.models?.[0]?.id, "gpt-test");
@@ -1709,6 +1867,7 @@ test("headless direct channel model add requires --yes and writes with explicit 
 test("extension command rejects headless writes without --yes and accepts explicit --yes", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-command-"));
   const targetPaths = paths(root);
+  await writeFile(targetPaths.modelsPath, JSON.stringify({ providers: { openai: { baseUrl: "https://api.openai.com/v1", models: [] } } }));
   const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(catalog()) } });
   const notifications: string[] = [];
   const ctx = {
@@ -1873,12 +2032,12 @@ test("literal API keys require explicit opt-in and safe references are retained"
   const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-api-key-policy-"));
   const targetPaths = paths(root);
   const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(catalog()) } });
-  const omitted = await doctor.proposeAdd({ target: "openai", modelId: "gpt-test", apiKey: "literal-secret", persistCache: false });
+  const omitted = await doctor.proposeAdd({ target: "https://api.openai.com/v1", providerId: "openai", modelId: "gpt-test", apiKey: "literal-secret", persistCache: false });
   assert.equal(omitted.config.providers?.openai?.apiKey, undefined);
   assert.match(omitted.warning ?? "", /not persisted/i);
-  const referenced = await doctor.proposeAdd({ target: "openai", modelId: "gpt-test", apiKey: "$OPENAI_API_KEY", persistCache: false });
+  const referenced = await doctor.proposeAdd({ target: "https://api.openai.com/v1", providerId: "openai", modelId: "gpt-test", apiKey: "$OPENAI_API_KEY", persistCache: false });
   assert.equal(referenced.config.providers?.openai?.apiKey, "$OPENAI_API_KEY");
-  const allowed = await doctor.proposeAdd({ target: "openai", modelId: "gpt-test", apiKey: "literal-secret", allowLiteralApiKey: true, persistCache: false });
+  const allowed = await doctor.proposeAdd({ target: "https://api.openai.com/v1", providerId: "openai", modelId: "gpt-test", apiKey: "literal-secret", allowLiteralApiKey: true, persistCache: false });
   assert.equal(allowed.config.providers?.openai?.apiKey, "literal-secret");
   assert.match(allowed.warning ?? "", /literal API key/i);
   assert.equal(JSON.stringify(allowed.plan).includes("literal-secret"), false);
@@ -2045,7 +2204,7 @@ test("headless dry-run takes precedence over --yes for mutations", async () => {
   const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(catalog()) } });
   const notifications: string[] = [];
   const ctx = { hasUI: false, ui: { notify: (message: string) => notifications.push(message) } } as never;
-  await runCommand("add openai gpt-test --yes --dry-run", ctx, doctor);
+  await runCommand("add openai https://api.openai.com/v1 gpt-test --yes --dry-run", ctx, doctor);
   assert.match(notifications.at(-1) ?? "", /not-persisted.*dry-run/i);
   await assert.rejects(() => readFile(targetPaths.modelsPath));
   await assert.rejects(() => readFile(targetPaths.modelsCachePath));

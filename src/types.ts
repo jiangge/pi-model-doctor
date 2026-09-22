@@ -1,10 +1,19 @@
 export type JsonObject = Record<string, unknown>;
 
-export type PiApi =
-  | "openai-completions"
-  | "openai-responses"
-  | "anthropic-messages"
-  | "google-generative-ai";
+export const PI_API_OPTIONS = [
+  "openai-completions",
+  "mistral-conversations",
+  "openai-responses",
+  "azure-openai-responses",
+  "openai-codex-responses",
+  "anthropic-messages",
+  "bedrock-converse-stream",
+  "google-generative-ai",
+  "google-vertex",
+  "pi-messages",
+] as const;
+
+export type PiApi = (typeof PI_API_OPTIONS)[number];
 
 export type ReasoningControlType = "toggle" | "effort" | "budget" | "adaptive" | "unknown";
 export type ReasoningLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
@@ -28,6 +37,10 @@ export interface DoctorMetadata {
   endpointNormalizationBlocked?: boolean;
   /** True when the user changed the pending API before model resolution. */
   endpointApiNormalizationBlocked?: boolean;
+  /** Fields explicitly chosen via configure: they stay doctor-managed for
+   * continuous provider-wide synchronization, but check/fix must not auto-revert
+   * them to the catalog value (the user's explicit protocol choice is preserved). */
+  explicitFields?: string[];
   version?: number;
   managedFields?: string[];
   managedValues?: JsonObject;
@@ -463,10 +476,12 @@ export interface AddInput {
   target: string;
   /** Explicit storage id for channel setup, as in `add providerA https://gateway.example/v1 [model]`. */
   providerId?: string;
-  /** When omitted and target is a URL, a provider-only entry with no model is created. */
+  /** Model id; omitted only for an explicit provider-id plus endpoint provider-only setup. */
   modelId?: string;
   /** Optional models.dev provider id used only to disambiguate metadata. */
   metadataProvider?: string;
+  /** Require a pre-existing provider when the command did not supply an endpoint. */
+  requireConfiguredProvider?: boolean;
   /** Transport protocol for a third-party channel; inferred when omitted. */
   api?: PiApi;
   /** An env/auth-store/command reference such as $OPENAI_API_KEY or !pi-auth. */
@@ -490,6 +505,22 @@ export interface SyncInput {
   allowLiteralApiKey?: boolean;
   dryRun?: boolean;
   persistCache?: boolean;
+}
+
+export interface SetApiInput {
+  /** Existing models.json provider id to modify. */
+  providerId: string;
+  /** Optional exact model id; omitted means provider-wide API synchronization. */
+  modelId?: string;
+  /** Explicit provider endpoint URL; never inferred or normalized by this command. */
+  endpoint?: string;
+  /** Optional Pi transport API; omitted fields remain unchanged. */
+  api?: PiApi;
+  /** An env/auth-store/command reference such as $OPENAI_API_KEY or !pi-auth. */
+  apiKey?: string;
+  /** Explicit opt-in for persisting a literal API key; never enabled by default. */
+  allowLiteralApiKey?: boolean;
+  dryRun?: boolean;
 }
 
 export interface FixOptions {

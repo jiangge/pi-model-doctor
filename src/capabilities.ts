@@ -21,6 +21,24 @@ const REASONING_LEVELS: ReasoningLevel[] = ["off", "minimal", "low", "medium", "
 // catalog only says that an adapter accepts a generic effort value.
 const EFFORT_LEVELS = ["minimal", "low", "medium", "high"];
 const DEFAULT_REASONING_BUDGET = 16_384;
+const OPENAI_COMPATIBLE_PROVIDER_IDS = new Set([
+  "openai",
+  "openai-compatible",
+  "groq",
+  "xai",
+  "fireworks",
+  "together",
+  "perplexity",
+  "cohere",
+  "nvidia",
+  "zhipuai",
+  "moonshot",
+  "openrouter",
+  "deepseek",
+  "mistral",
+  "qwen",
+  "zai",
+]);
 
 const PROVIDER_ENDPOINTS: Record<string, string> = {
   openai: "https://api.openai.com/v1",
@@ -278,46 +296,61 @@ export function inferProviderEndpoint(provider: ModelsDevProvider, requestedEndp
   return PROVIDER_ENDPOINTS[provider.id.toLowerCase()];
 }
 
-export function detectChannelApi(endpoint?: string, explicitApi?: PiApi): PiApi {
-  if (explicitApi) return explicitApi;
-  const haystack = (endpoint ?? "").toLowerCase();
-  if (haystack.includes("anthropic") || haystack.includes("claude")) return "anthropic-messages";
-  if (haystack.includes("google") || haystack.includes("gemini") || haystack.includes("generativelanguage")) return "google-generative-ai";
+function inferApiFromText(value: string): PiApi | undefined {
+  const haystack = value.toLowerCase();
+  // More specific protocols must be checked before their broader families.
+  if (haystack.includes("pi-messages") || haystack.includes("pi_messages")) return "pi-messages";
+  if (haystack.includes("openai-completions") || haystack.includes("openai_completions")) return "openai-completions";
+  if (haystack.includes("openai-codex") || haystack.includes("codex")) return "openai-codex-responses";
+  if (haystack.includes("azure-openai") || haystack.includes("azure_openai") || haystack.includes("azure")) return "azure-openai-responses";
+  if (haystack.includes("bedrock") || haystack.includes("amazonaws")) return "bedrock-converse-stream";
+  if (haystack.includes("mistral-conversations") || haystack.includes("mistral_conversations")) return "mistral-conversations";
+  if (haystack.includes("mistral") || haystack.includes("mixtral")) return "mistral-conversations";
+  if (haystack.includes("google-vertex") || haystack.includes("google_vertex") || haystack.includes("vertex")) return "google-vertex";
+  if (haystack.includes("anthropic") || haystack.includes("claude") || haystack.includes("minimax.io/anthropic") || haystack.includes("minimaxi.com/anthropic")) {
+    return "anthropic-messages";
+  }
+  if (haystack.includes("google") || haystack.includes("gemini") || haystack.includes("gemma") || haystack.includes("generativelanguage")) {
+    return "google-generative-ai";
+  }
   if (haystack.includes("responses")) return "openai-responses";
-  return "openai-completions";
+  return undefined;
+}
+
+/**
+ * Model ids and names are only weak protocol hints. Endpoint and provider
+ * evidence is resolved separately and takes precedence over this result.
+ */
+export function inferApiFromModelName(model?: Pick<ModelsDevModel, "id" | "name"> | string): PiApi | undefined {
+  if (!model) return undefined;
+  const value = typeof model === "string" ? model : `${model.id} ${model.name ?? ""}`;
+  return inferApiFromText(value);
+}
+
+export function detectChannelApi(endpoint?: string, explicitApi?: PiApi, modelHint?: Pick<ModelsDevModel, "id" | "name"> | string): PiApi {
+  if (explicitApi) return explicitApi;
+  return inferApiFromText(endpoint ?? "") ?? inferApiFromModelName(modelHint) ?? "openai-completions";
 }
 
 /**
  * Resolve an API family for endpoint-versioning only.
  *
  * A custom channel still owns the transport API written to models.json. This
- * helper is deliberately separate so a unique models.dev match can provide a
- * conservative `/v1` hint without copying catalog provider identity into the
- * channel. Explicit channel API and recognizable endpoint names win; an
- * unknown catalog provider does not silently become OpenAI-compatible.
+ * helper uses endpoint/provider evidence first, then a model-name hint, and
+ * falls back to the default OpenAI-compatible protocol when no stronger
+ * signal exists.
  */
 export function endpointApiForModel(
   provider: ModelsDevProvider | undefined,
   endpoint?: string,
   explicitApi?: PiApi,
+  modelHint?: Pick<ModelsDevModel, "id" | "name"> | string,
 ): PiApi | undefined {
   if (explicitApi) return explicitApi;
-  // A recognizable endpoint protocol is stronger evidence than the catalog
-  // provider identity because a third-party gateway can proxy any model.
-  const endpointApi = detectChannelApi(endpoint);
-  if (endpointApi !== "openai-completions") return endpointApi;
-  if (provider) {
-    const adapter = resolveProviderAdapter(provider, provider.api);
-    if (adapter.id === "anthropic") return "anthropic-messages";
-    if (adapter.id === "google") return "google-generative-ai";
-    if (adapter.id === "openai-responses") return "openai-responses";
-    if (["openai-compatible", "openrouter", "deepseek", "together", "zai", "qwen"].includes(adapter.id)) {
-      return "openai-completions";
-    }
-  }
-  // A generic URL with unknown metadata remains unresolved rather than being
-  // silently treated as OpenAI-compatible.
-  return undefined;
+  const endpointApi = endpoint ? inferApiFromText(endpoint) : undefined;
+  if (endpointApi) return endpointApi;
+  if (provider) return detectPiApi(provider, endpoint, undefined, modelHint);
+  return endpoint ? (inferApiFromModelName(modelHint) ?? "openai-completions") : inferApiFromModelName(modelHint);
 }
 
 /**
@@ -339,17 +372,20 @@ export function normalizeEndpointForApi(endpoint: string | undefined, api: PiApi
   }
 }
 
-export function detectPiApi(provider: ModelsDevProvider, endpoint?: string, explicitApi?: PiApi): PiApi {
+export function detectPiApi(
+  provider: ModelsDevProvider,
+  endpoint?: string,
+  explicitApi?: PiApi,
+  modelHint?: Pick<ModelsDevModel, "id" | "name"> | string,
+): PiApi {
   if (explicitApi) return explicitApi;
-  const haystack = `${provider.id} ${provider.name ?? ""} ${provider.api ?? ""} ${endpoint ?? ""}`.toLowerCase();
-  if (haystack.includes("anthropic") || haystack.includes("claude") || haystack.includes("minimax.io/anthropic") || haystack.includes("minimaxi.com/anthropic")) {
-    return "anthropic-messages";
-  }
-  if (haystack.includes("google") || haystack.includes("gemini") || haystack.includes("generativelanguage")) {
-    return "google-generative-ai";
-  }
-  if (haystack.includes("responses")) return "openai-responses";
-  return "openai-completions";
+  const endpointApi = endpoint ? inferApiFromText(endpoint) : undefined;
+  if (endpointApi) return endpointApi;
+  const providerText = `${provider.id} ${provider.name ?? ""} ${provider.api ?? ""}`;
+  return inferApiFromText(providerText)
+    ?? (OPENAI_COMPATIBLE_PROVIDER_IDS.has(provider.id.toLowerCase()) ? "openai-completions" : undefined)
+    ?? inferApiFromModelName(modelHint)
+    ?? "openai-completions";
 }
 
 export function resolveReasoning(provider: ModelsDevProvider | undefined, model: ModelsDevModel | undefined): NormalizedReasoning {
@@ -550,10 +586,10 @@ export function resolveCapabilities(
   policy = defaultPolicyCatalog(),
 ): CapabilityResolution {
   const baseProvider = provider ?? { id: "unknown", models: {} };
-  const adapter = resolveProviderAdapter(baseProvider, endpoint);
+  const adapter = resolveProviderAdapter(baseProvider, endpoint, undefined, model);
   const cache = resolveCache(provider, model);
   const reasoning = resolveReasoning(provider, model);
-  const api = detectPiApi(baseProvider, endpoint);
+  const api = detectPiApi(baseProvider, endpoint, undefined, model);
   return {
     cache,
     reasoning,
@@ -570,7 +606,7 @@ export function toPiModel(
   options: { endpoint?: string; now?: Date; sourceName?: string; capabilitySource?: NormalizedCache["source"]; policy?: PolicyCatalog; api?: PiApi; metadataOnly?: boolean; transportOwned?: boolean; providerId?: string; adapterProviderId?: string } = {},
 ): PiModel {
   const policy = options.policy ?? defaultPolicyCatalog(options.now);
-  const api = detectPiApi(provider, options.endpoint ?? provider.api, options.api);
+  const api = detectPiApi(provider, options.endpoint ?? provider.api, options.api, source);
   const reasoning = resolveReasoning(provider, source);
   const cache = resolveCache(provider, source, options.capabilitySource);
   const supportedInput = source.modalities?.input?.filter((value): value is "text" | "image" => value === "text" || value === "image") ?? [];
@@ -633,28 +669,48 @@ export interface ProviderAdapter {
   cacheControlFormat?: "anthropic";
 }
 
+function isGoogleApi(api: PiApi): boolean {
+  return api === "google-generative-ai" || api === "google-vertex";
+}
+
 export function adapterIdForPiApi(api: PiApi): string {
   switch (api) {
     case "anthropic-messages": return "anthropic";
-    case "google-generative-ai": return "google";
-    case "openai-responses": return "openai-responses";
+    case "google-generative-ai":
+    case "google-vertex": return "google";
+    case "openai-responses":
+    case "azure-openai-responses":
+    case "openai-codex-responses": return "openai-responses";
+    // Mistral's Chat Completions API is OpenAI-compatible at the capability
+    // layer; keep it mapped to the verified openai-compatible policy instead
+    // of an unregistered adapter id that would silently degrade to fallback.
+    case "mistral-conversations": return "openai-compatible";
+    // No verified capability policy exists for these Pi adapters yet; return
+    // fallback so capability resolution stays advisory instead of over-claiming
+    // provider-specific fields through the generic fallback policy.
+    case "bedrock-converse-stream":
+    case "pi-messages": return "fallback";
     default: return "openai-compatible";
   }
 }
 
-export function resolveProviderAdapter(provider: ModelsDevProvider, endpoint?: string, explicitApi?: PiApi): ProviderAdapter {
-  const api = detectPiApi(provider, endpoint, explicitApi);
+export function resolveProviderAdapter(
+  provider: ModelsDevProvider,
+  endpoint?: string,
+  explicitApi?: PiApi,
+  modelHint?: Pick<ModelsDevModel, "id" | "name"> | string,
+): ProviderAdapter {
+  const api = detectPiApi(provider, endpoint, explicitApi, modelHint);
   const id = provider.id.toLowerCase();
   if (api === "anthropic-messages") return { id: "anthropic", api, cacheControlFormat: "anthropic" };
-  if (api === "google-generative-ai") return { id: "google", api };
-  if (api === "openai-responses") return { id: "openai-responses", api, thinkingFormat: "openai" };
+  if (api === "google-generative-ai" || api === "google-vertex") return { id: "google", api };
+  if (api === "openai-responses" || api === "azure-openai-responses" || api === "openai-codex-responses") return { id: "openai-responses", api, thinkingFormat: "openai" };
   if (id.includes("openrouter")) return { id: "openrouter", api, thinkingFormat: "openrouter" };
   if (id.includes("deepseek")) return { id: "deepseek", api, thinkingFormat: "deepseek" };
   if (id.includes("together")) return { id: "together", api, thinkingFormat: "together" };
   if (id.includes("zhipu") || id === "zai" || id.includes("glm")) return { id: "zai", api, thinkingFormat: "zai" };
   if (id.includes("qwen") || id.includes("dashscope") || id.includes("alibaba")) return { id: "qwen", api, thinkingFormat: "qwen" };
-  const knownOpenAiCompatible = ["openai", "groq", "mistral", "xai", "fireworks", "together", "perplexity", "cohere", "nvidia", "zhipuai", "moonshot"];
-  if (id === "openai-compatible" || id.includes("openai-compatible") || knownOpenAiCompatible.some((known) => id === known || id.startsWith(`${known}-`))) return { id: "openai-compatible", api, thinkingFormat: "openai" };
+  if (id === "openai-compatible" || id.includes("openai-compatible") || [...OPENAI_COMPATIBLE_PROVIDER_IDS].some((known) => id === known || id.startsWith(`${known}-`))) return { id: "openai-compatible", api, thinkingFormat: "openai" };
   return { id: "fallback", api, thinkingFormat: "openai" };
 }
 
@@ -767,7 +823,7 @@ export function capabilityCompat(
       compat.supportsReasoningEffort = adapter.id !== "fallback" && Boolean(adapterPolicy.reasoning.effortField);
       compat.reasoningEffortField = adapterPolicy.reasoning.effortField;
       compat.thinkingFormat = adapter.thinkingFormat ?? "openai";
-      if (api === "google-generative-ai") {
+      if (isGoogleApi(api)) {
         compat.thinkingConfig = { includeThoughts: true, thinkingLevel: reasoning.defaultLevel };
       }
       if (!adapterPolicy.reasoning.effortField) reasoningWarnings.push("Effort reasoning is detected but has no provider-specific field.");
@@ -787,7 +843,7 @@ export function capabilityCompat(
       compat.reasoningBudgetMinTokens = reasoning.minBudgetTokens ?? reasoning.budgetMinTokens;
       compat.reasoningBudgetTokens = reasoning.budgetTokens;
       compat.thinkingFormat = adapter.thinkingFormat ?? "budget";
-      if (api === "google-generative-ai") {
+      if (isGoogleApi(api)) {
         compat.thinkingConfig = { includeThoughts: true, thinkingBudget: reasoning.budgetTokens };
       } else if (api === "anthropic-messages") {
         compat.thinkingConfig = { type: "enabled", budget_tokens: reasoning.budgetTokens };
@@ -814,7 +870,7 @@ export function capabilityCompat(
       compat.reasoningToggleField = adapterPolicy.reasoning.toggleField;
       compat.reasoningToggleOnValue = reasoning.toggleOnValue;
       compat.reasoningToggleOffValue = reasoning.toggleOffValue;
-      if (api === "google-generative-ai") compat.thinkingConfig = { includeThoughts: true };
+      if (isGoogleApi(api)) compat.thinkingConfig = { includeThoughts: true };
       if (api === "anthropic-messages") compat.thinkingConfig = { type: "enabled" };
       if (!adapterPolicy.reasoning.toggleField) reasoningWarnings.push("Toggle reasoning is detected but has no provider-specific field.");
     } else if (reasoning.fallback) {
@@ -831,7 +887,7 @@ export function capabilityCompat(
     }
     if (reasoningWarnings.length > 0) compat.reasoningWarnings = [...new Set(reasoningWarnings)];
   }
-  if (api === "google-generative-ai" && reasoning.supported) compat.supportsTemperature = source.temperature === true;
+  if (isGoogleApi(api) && reasoning.supported) compat.supportsTemperature = source.temperature === true;
   return Object.keys(compat).length === 0 ? undefined : compat;
 }
 

@@ -1,18 +1,22 @@
 import { getAgentDir, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { ModelDoctor, type DoctorListItem } from "./doctor.ts";
 import { DoctorError, errorMessage, looksLikeCredentialValue, redactSensitiveText } from "./json.ts";
-import type { ChangePlan, CheckResult, ModelCandidate, RefreshResult, RuntimeActivationStatus } from "./types.ts";
+import { PI_API_OPTIONS } from "./types.ts";
+import type { ChangePlan, CheckResult, ModelCandidate, PiApi, RefreshResult, RuntimeActivationStatus } from "./types.ts";
 import { resolve } from "node:path";
 
 export interface ParsedCommand {
-  command: "add" | "list" | "check" | "fix" | "remove" | "refresh" | "sync" | "migrate" | "cleanup-backups" | "rollback" | "help" | "invalid";
+  command: "add" | "configure" | "list" | "check" | "fix" | "remove" | "refresh" | "sync" | "migrate" | "cleanup-backups" | "rollback" | "help" | "invalid";
   args: string[];
   flags: Record<string, string | boolean>;
 }
 
 const BOOLEAN_FLAGS = new Set(["dry-run", "yes", "force", "remove-source", "allow-literal-api-key"]);
+const PI_API_FLAG_USAGE = `<${PI_API_OPTIONS.join("|")}>`;
+const PI_API_FLAG_VALUES = PI_API_OPTIONS.join(", ");
 const COMMAND_FLAGS: Record<string, ReadonlySet<string>> = {
   add: new Set(["api-key", "metadata-provider", "api", "dry-run", "yes", "allow-literal-api-key"]),
+  configure: new Set(["api-key", "api", "dry-run", "yes", "allow-literal-api-key"]),
   sync: new Set(["models", "api-key", "metadata-provider", "api", "dry-run", "yes", "allow-literal-api-key"]),
   list: new Set(),
   check: new Set(),
@@ -93,9 +97,9 @@ export function formatCandidates(candidates: ModelCandidate[]): string {
 
 export function registerModelDoctorCommand(pi: ExtensionAPI, doctor: ModelDoctor): void {
   pi.registerCommand("model-doctor", {
-    description: "Discover, sync, check, fix, migrate, and manage Pi models.json",
+    description: "Discover, sync, configure APIs, check, fix, migrate, and manage Pi models.json",
     getArgumentCompletions: (prefix) => {
-      const values = ["add", "list", "check", "fix", "remove", "refresh", "sync", "migrate", "cleanup-backups", "rollback", "help"];
+      const values = ["add", "configure", "list", "check", "fix", "remove", "refresh", "sync", "migrate", "cleanup-backups", "rollback", "help"];
       return values.filter((value) => value.startsWith(prefix)).map((value) => ({ value, label: value }));
     },
     handler: async (rawArgs, ctx) => {
@@ -111,6 +115,9 @@ export async function runCommand(rawArgs: string, ctx: ExtensionCommandContext, 
     switch (parsed.command) {
       case "add":
         await runAdd(parsed.args, parsed.flags, ctx, doctor);
+        return;
+      case "configure":
+        await runSetApi(parsed.args, parsed.flags, ctx, doctor);
         return;
       case "list":
         ctx.ui.notify(formatList(await doctor.list(parsed.args[0])), "info");
@@ -196,9 +203,9 @@ async function runCleanupBackups(args: string[], flags: Record<string, string | 
   ctx.ui.notify(`Removed ${removed.length} backup(s).\nStatus: persisted.`, "warning");
 }
 
-function parsePiApiFlag(value: string): "openai-completions" | "openai-responses" | "anthropic-messages" | "google-generative-ai" {
-  if (value === "openai-completions" || value === "openai-responses" || value === "anthropic-messages" || value === "google-generative-ai") return value;
-  throw new DoctorError(`Flag --api must be one of openai-completions, openai-responses, anthropic-messages, google-generative-ai`, "invalid-target");
+function parsePiApiFlag(value: string): PiApi {
+  if ((PI_API_OPTIONS as readonly string[]).includes(value)) return value as PiApi;
+  throw new DoctorError(`Flag --api must be one of ${PI_API_FLAG_VALUES}`, "invalid-target");
 }
 
 function parseNonNegativeIntegerFlag(value: string | boolean | undefined, name: string): number | undefined {
@@ -225,7 +232,7 @@ function parseModelIdsFlag(value: string | boolean | undefined): string[] {
 
 async function runSync(args: string[], flags: Record<string, string | boolean>, ctx: ExtensionCommandContext, doctor: ModelDoctor): Promise<void> {
   const target = args[0];
-  if (!target) throw new DoctorError("Usage: /model-doctor sync <provider-or-url> [--models <id1,id2>] [--metadata-provider <models.dev-provider>] [--api <protocol>] [--api-key <reference>] [--allow-literal-api-key] [--dry-run] [--yes]", "invalid-target");
+  if (!target) throw new DoctorError(`Usage: /model-doctor sync <provider-or-url> [--models <id1,id2>] [--metadata-provider <models.dev-provider>] [--api ${PI_API_FLAG_USAGE}] [--api-key <reference>] [--allow-literal-api-key] [--dry-run] [--yes]`, "invalid-target");
   const dryRun = flags["dry-run"] === true;
   let metadataProvider = typeof flags["metadata-provider"] === "string" ? flags["metadata-provider"] : undefined;
   const explicitModelIds = parseModelIdsFlag(flags.models);
@@ -297,19 +304,25 @@ async function runSync(args: string[], flags: Record<string, string | boolean>, 
 }
 
 async function runAdd(args: string[], flags: Record<string, string | boolean>, ctx: ExtensionCommandContext, doctor: ModelDoctor): Promise<void> {
-  const target = args[0];
-  if (!target) throw new DoctorError("Usage: /model-doctor add <provider-or-url> [model] | add <provider-id> <endpoint-url> [model] [--metadata-provider <models.dev-provider>] [--api <protocol>] [--api-key <reference>] [--allow-literal-api-key] [--dry-run] [--yes]", "invalid-target");
+  const providerId = args[0];
+  if (!providerId || /^https?:\/\//i.test(providerId)) {
+    throw new DoctorError(`Usage: /model-doctor add <provider-id> [endpoint-url] [model] [--metadata-provider <models.dev-provider>] [--api ${PI_API_FLAG_USAGE}] [--api-key <reference>] [--allow-literal-api-key] [--dry-run] [--yes]`, "invalid-target");
+  }
   const dryRun = flags["dry-run"] === true;
-  const explicitEndpoint = !/^https?:\/\//i.test(target) && /^https?:\/\//i.test(args[1] ?? "") ? args[1] : undefined;
-  const explicitProviderId = explicitEndpoint ? target : undefined;
+  const selectedApi = typeof flags.api === "string" ? parsePiApiFlag(flags.api) : undefined;
+  const explicitEndpoint = /^https?:\/\//i.test(args[1] ?? "") ? args[1] : undefined;
+  const explicitProviderId = explicitEndpoint ? providerId : undefined;
   let modelId = explicitEndpoint ? args[2] : args[1];
-  let resolvedTarget = explicitEndpoint ?? target;
+  let resolvedTarget = explicitEndpoint ?? providerId;
   let selectedMetadataProvider = typeof flags["metadata-provider"] === "string" ? flags["metadata-provider"] : undefined;
-  if (!modelId && !explicitEndpoint && ctx.hasUI && !/^https?:\/\//i.test(target)) {
-    const candidates = await doctor.listCandidates(target, false, undefined, selectedMetadataProvider);
-    if (candidates.length === 0) throw new DoctorError(`No models.dev models found for ${target}; provide an explicit model id`, "invalid-target");
+  if (!explicitEndpoint && !await doctor.isProviderConfigured(providerId)) {
+    throw new DoctorError(`Provider ${providerId} is not configured in models.json; provide endpoint-url to create it`, "invalid-target");
+  }
+  if (!modelId && !explicitEndpoint && ctx.hasUI) {
+    const candidates = await doctor.listCandidates(providerId, false, undefined, selectedMetadataProvider);
+    if (candidates.length === 0) throw new DoctorError(`No models.dev models found for ${providerId}; provide an explicit model id`, "invalid-target");
     const choices = candidates.map((candidate, index) => formatCandidateLabel(candidate, index));
-    const selected = await ctx.ui.select(`Select model for ${redactSensitiveText(target)}`, choices);
+    const selected = await ctx.ui.select(`Select model for ${redactSensitiveText(providerId)}`, choices);
     if (!selected) {
       ctx.ui.notify("Add cancelled. Status: not-persisted; models.json was not changed.", "info");
       return;
@@ -317,16 +330,14 @@ async function runAdd(args: string[], flags: Record<string, string | boolean>, c
     const selectedIndex = choices.indexOf(selected);
     const candidate = selectedIndex >= 0 ? candidates[selectedIndex] : undefined;
     if (!candidate) throw new DoctorError("The selected model is no longer available; retry model discovery", "invalid-target");
-    // Preserve an explicitly supplied provider URL (including a proxy) while
-    // using the selected catalog provider id for ordinary provider/model
-    // discovery targets.
-    resolvedTarget = /^https?:\/\//i.test(target) ? target : candidate.providerId;
+    // Keep the configured provider id as the transport target. A candidate
+    // provider may only supply metadata for an unlisted channel.
+    resolvedTarget = providerId;
     modelId = candidate.id;
     if (candidate.metadataOnly) selectedMetadataProvider = candidate.providerId;
   }
-  const providerOnly = !modelId && /^https?:\/\//i.test(resolvedTarget);
+  const providerOnly = !modelId && explicitEndpoint !== undefined;
   if (!modelId && !providerOnly) throw new DoctorError("Model selection is required; provide an explicit model id in non-interactive mode", "selection-required");
-  const selectedApi = typeof flags.api === "string" ? parsePiApiFlag(flags.api) : undefined;
   ensureHeadlessAuthorization(ctx, flags, "add", dryRun);
   const apiKey = typeof flags["api-key"] === "string" ? flags["api-key"] : undefined;
   const proposal = await doctor.proposeAdd({
@@ -334,6 +345,7 @@ async function runAdd(args: string[], flags: Record<string, string | boolean>, c
     providerId: explicitProviderId,
     modelId,
     metadataProvider: selectedMetadataProvider,
+    requireConfiguredProvider: explicitEndpoint === undefined,
     api: selectedApi,
     apiKey,
     allowLiteralApiKey: flags["allow-literal-api-key"] === true,
@@ -365,6 +377,50 @@ async function runAdd(args: string[], flags: Record<string, string | boolean>, c
   const outcome = status === "activation-failed"
     ? `Add was persisted for ${redactSensitiveText(proposal.target)}, but runtime activation failed.`
     : `Add succeeded for ${redactSensitiveText(proposal.target)}.`;
+  ctx.ui.notify(`${outcome}\n${preview}\nStatus: ${statusMessage(status)}\nApplied. Backup: ${applied.backupPath ? redactSensitiveText(applied.backupPath) : "none (new file)"}`, status === "activation-failed" ? "warning" : "info");
+}
+
+async function runSetApi(args: string[], flags: Record<string, string | boolean>, ctx: ExtensionCommandContext, doctor: ModelDoctor): Promise<void> {
+  const providerId = args[0];
+  if (!providerId || /^https?:\/\//i.test(providerId)) {
+    throw new DoctorError(`Usage: /model-doctor configure <provider-id> [endpoint-url] [model] [--api ${PI_API_FLAG_USAGE}] [--api-key <reference>] [--allow-literal-api-key] [--dry-run] [--yes]`, "invalid-target");
+  }
+  const endpoint = /^https?:\/\//i.test(args[1] ?? "") ? args[1] : undefined;
+  const modelId = endpoint === undefined ? args[1] : args[2];
+  const dryRun = flags["dry-run"] === true;
+  const selectedApi = typeof flags.api === "string" ? parsePiApiFlag(flags.api) : undefined;
+  const apiKey = typeof flags["api-key"] === "string" ? flags["api-key"] : undefined;
+  ensureHeadlessAuthorization(ctx, flags, "configure", dryRun);
+  const proposal = await doctor.proposeSetApi({
+    providerId,
+    endpoint,
+    modelId,
+    api: selectedApi,
+    apiKey,
+    allowLiteralApiKey: flags["allow-literal-api-key"] === true,
+    dryRun,
+  });
+  const preview = [
+    `Configure transport for ${redactSensitiveText(proposal.target)}`,
+    proposal.warning ? `Warning: ${redactSensitiveText(proposal.warning)}` : undefined,
+    formatPlan(proposal.plan),
+  ].filter(Boolean).join("\n");
+  if (dryRun) {
+    ctx.ui.notify(`Dry-run succeeded for ${redactSensitiveText(proposal.target)}.\n${preview}\nStatus: not-persisted (dry-run).`, "info");
+    return;
+  }
+  if (proposal.plan.changes.length === 0) {
+    ctx.ui.notify(`Configure succeeded for ${redactSensitiveText(proposal.target)}: transport configuration is already up to date.\n${preview}\nNo changes needed.\nStatus: already-persisted (no write or backup was needed).`, "info");
+    return;
+  }
+  await requireAuthorization(ctx, flags, "configure", preview);
+  const applied = await doctor.applySetApi(proposal);
+  const status = proposal.modelIds.length > 0
+    ? await activateRuntime(ctx, doctor, proposal.modelIds.map((model) => ({ provider: proposal.providerId, model, present: true })))
+    : "persisted-reload-required";
+  const outcome = status === "activation-failed"
+    ? `Configure was persisted for ${redactSensitiveText(proposal.target)}, but runtime activation failed.`
+    : `Configure succeeded for ${redactSensitiveText(proposal.target)}.`;
   ctx.ui.notify(`${outcome}\n${preview}\nStatus: ${statusMessage(status)}\nApplied. Backup: ${applied.backupPath ? redactSensitiveText(applied.backupPath) : "none (new file)"}`, status === "activation-failed" ? "warning" : "info");
 }
 
@@ -556,7 +612,7 @@ function validateCommand(parsed: ParsedCommand): void {
     if (unknown) throw new DoctorError(`Unknown flag --${unknown}; use /model-doctor help for usage`, "invalid-target");
   }
   const maxArgs = parsed.command === "migrate" ? 2
-    : parsed.command === "add" ? 3
+    : parsed.command === "add" || parsed.command === "configure" ? 3
       : parsed.command === "sync" ? 1
         : parsed.command === "rollback" ? 1
           : ["list", "check", "fix", "remove"].includes(parsed.command) ? 1
@@ -567,8 +623,13 @@ function validateCommand(parsed: ParsedCommand): void {
   if (parsed.command === "migrate" && parsed.args[1] && parsed.flags.to !== undefined) {
     throw new DoctorError("Migration destination must be provided either positionally or with --to, not both", "invalid-target");
   }
-  if (parsed.command === "add" && parsed.args.length === 3 && (/^https?:\/\//i.test(parsed.args[0] ?? "") || !/^https?:\/\//i.test(parsed.args[1] ?? ""))) {
-    throw new DoctorError("Three add arguments require: add <provider-id> <endpoint-url> [model]", "invalid-target");
+  if (parsed.command === "add" || parsed.command === "configure") {
+    if (/^https?:\/\//i.test(parsed.args[0] ?? "")) {
+      throw new DoctorError(`${parsed.command} requires provider-id as its first argument; URL-first syntax is not supported`, "invalid-target");
+    }
+    if (parsed.args.length === 3 && !/^https?:\/\//i.test(parsed.args[1] ?? "")) {
+      throw new DoctorError(`Three ${parsed.command} arguments require: ${parsed.command} <provider-id> <endpoint-url> [model]`, "invalid-target");
+    }
   }
   for (const [name, value] of Object.entries(parsed.flags)) {
     if (BOOLEAN_FLAGS.has(name) && typeof value !== "boolean") {
@@ -593,24 +654,25 @@ function formatRefresh(result: RefreshResult): string {
 
 function helpText(): string {
   return [
-    "/model-doctor add <provider-or-url> [model] [--metadata-provider <models.dev-provider>] [--api <protocol>] [--api-key <reference>] [--allow-literal-api-key] [--dry-run] [--yes]",
-    "/model-doctor add <provider-id> <endpoint-url> [model] [--metadata-provider <models.dev-provider>] [--api <protocol>] [--api-key <reference>] [--allow-literal-api-key] [--dry-run] [--yes]",
+    `/model-doctor add <provider-id> [endpoint-url] [model] [--metadata-provider <models.dev-provider>] [--api ${PI_API_FLAG_USAGE}] [--api-key <reference>] [--allow-literal-api-key] [--dry-run] [--yes]`,
+    `/model-doctor configure <provider-id> [endpoint-url] [model] [--api ${PI_API_FLAG_USAGE}] [--api-key <reference>] [--allow-literal-api-key] [--dry-run] [--yes]`,
     "/model-doctor list [provider]",
     "/model-doctor check [provider/model]",
     "/model-doctor fix [provider/model] [--dry-run] [--yes]",
     "/model-doctor remove <provider/model> [--dry-run] [--yes]",
     "/model-doctor refresh [--force] [--dry-run]",
-    "/model-doctor sync <provider-or-url> [--models <id1,id2>] [--metadata-provider <models.dev-provider>] [--api <protocol>] [--api-key <reference>] [--allow-literal-api-key] [--dry-run] [--yes]",
+    `/model-doctor sync <provider-or-url> [--models <id1,id2>] [--metadata-provider <models.dev-provider>] [--api ${PI_API_FLAG_USAGE}] [--api-key <reference>] [--allow-literal-api-key] [--dry-run] [--yes]`,
     "/model-doctor migrate <provider/model> [--to <provider/model>] [--dry-run] [--yes] [--remove-source]",
     "/model-doctor cleanup-backups [--keep <count>] [--max-age-ms <milliseconds>] [--dry-run] [--yes]",
     "/model-doctor rollback <models.json.bak-timestamp> [--dry-run] [--yes]",
-
+    `Supported --api values: ${PI_API_FLAG_VALUES}`,
+    "With add/configure, a URL in the second positional slot is treated as endpoint-url; otherwise it is treated as model. URL-first add syntax is not supported.",
     "Non-interactive writes require --yes; --dry-run never writes models.json, backups, or caches. Successful writes report persisted-and-active, persisted-reload-required, or activation-failed.",
   ].join("\n");
 }
 
 function isCommand(value: string): value is Exclude<ParsedCommand["command"], "invalid"> {
-  return ["add", "list", "check", "fix", "remove", "refresh", "sync", "migrate", "cleanup-backups", "rollback", "help"].includes(value);
+  return ["add", "configure", "list", "check", "fix", "remove", "refresh", "sync", "migrate", "cleanup-backups", "rollback", "help"].includes(value);
 }
 
 function tokenize(input: string): string[] {

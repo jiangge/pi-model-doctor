@@ -9,6 +9,7 @@ import {
   getModels,
   getProviders,
   hasDoctorMetadata,
+  isExplicitField,
   isRecord,
   jsonEqual,
   looksLikeCredentialValue,
@@ -44,6 +45,7 @@ import type {
   Finding,
   FindingCode,
   FixOptions,
+  JsonObject,
   MigrateInput,
   ModelCandidate,
   ModelsDevCatalog,
@@ -57,8 +59,10 @@ import type {
   PolicyCatalog,
   ProviderMatch,
   RefreshResult,
+  SetApiInput,
   SyncInput,
 } from "./types.ts";
+import { PI_API_OPTIONS } from "./types.ts";
 import {
   DEFAULT_CONTEXT_WINDOW,
   DEFAULT_COST,
@@ -97,6 +101,19 @@ export interface SyncProposal {
   baseExisted?: boolean;
   plan: ChangePlan;
   warnings: string[];
+  dryRun?: boolean;
+}
+
+export interface SetApiProposal {
+  target: string;
+  providerId: string;
+  modelId?: string;
+  modelIds: string[];
+  config: PiModelsJson;
+  baseFingerprint?: string;
+  baseExisted?: boolean;
+  plan: ChangePlan;
+  warning?: string;
   dryRun?: boolean;
 }
 
@@ -166,6 +183,11 @@ export class ModelDoctor {
 
   getModelsPath(): string {
     return this.options.paths.modelsPath;
+  }
+
+  async isProviderConfigured(providerId: string): Promise<boolean> {
+    const { data } = await readModelsJson(this.options.paths.modelsPath);
+    return findConfiguredProviderById(getProviders(data), providerId) !== undefined;
   }
 
   async list(providerId?: string): Promise<DoctorListItem[]> {
@@ -288,6 +310,10 @@ export class ModelDoctor {
     if (input.api !== undefined && !isPiApi(input.api)) throw new DoctorError("API protocol must be a supported Pi API identifier", "invalid-target");
     const loadedConfig = await readModelsJson(this.options.paths.modelsPath);
     const { data } = loadedConfig;
+    const configuredProviders = getProviders(data);
+    if (input.requireConfiguredProvider !== false && !looksLikeUrl(target) && requestedProviderId === undefined && !findConfiguredProviderById(configuredProviders, target)) {
+      throw new DoctorError(`Provider ${target} is not configured in models.json; provide endpoint-url to create it`, "invalid-target");
+    }
     let catalog: ModelsDevCatalog | undefined;
     let catalogSource: AddProposal["catalogSource"] = "fallback";
     let warning: string | undefined;
@@ -302,7 +328,6 @@ export class ModelDoctor {
       warning = error.message;
     }
 
-    const configuredProviders = getProviders(data);
     const configuredByTarget = findConfiguredProvider(configuredProviders, target);
     const configuredByExplicitId = requestedProviderId ? findConfiguredProviderById(configuredProviders, requestedProviderId) : undefined;
     if (requestedProviderId && configuredByTarget && configuredByTarget.id !== configuredByExplicitId?.id) {
@@ -443,27 +468,29 @@ export class ModelDoctor {
     const pendingApiChanged = provisionalProviderOnly && configuredEntry?.provider !== undefined
       ? isPendingApiChanged(configuredEntry.provider)
       : false;
+    const configuredModelApis = configuredEntry
+      ? [...new Set(getModels(configuredEntry.provider).map((model) => isPiApi(model.api) ? model.api : undefined).filter((api): api is PiApi => api !== undefined))]
+      : [];
+    const configuredModelApi = configuredModelApis.length === 1 ? configuredModelApis[0] : undefined;
     const configuredChannelApi = configuredEntry && isPiApi(configuredEntry.provider.api)
       && (!provisionalProviderOnly || pendingMetadata?.endpointApiExplicit === true || pendingApiChanged)
       ? configuredEntry.provider.api
-      : undefined;
+      : configuredModelApi;
     // While a provider-only channel is pending, resolve the API family from
     // the selected model/provider metadata rather than locking in the URL's
     // initial heuristic. Explicit --api or a later user edit remains owned by
     // the channel and takes precedence.
-    const modelApi = endpointApiForModel(provider, provisionalProviderOnly ? undefined : inferredEndpoint, input.api ?? configuredChannelApi);
+    const modelApi = endpointApiForModel(provider, provisionalProviderOnly ? undefined : inferredEndpoint, input.api ?? configuredChannelApi, sourceModel);
     const inferredChannelApi = provisionalProviderOnly && modelApi
       ? modelApi
-      : (metadataOnly || looksLikeUrl(target))
-        ? detectChannelApi(inferredEndpoint)
-        : detectPiApi(provider, inferredEndpoint);
+      : detectPiApi(provider, inferredEndpoint, undefined, sourceModel);
     const channelApi = input.api ?? configuredChannelApi ?? inferredChannelApi;
     // A direct channel URL can be a bare host while its resolved metadata tells
     // us that the model speaks an API family with a conventional version path.
     // Only root URLs are normalized; existing paths remain channel-owned.
     const endpointApi = provisionalProviderOnly
       ? (input.api ?? configuredChannelApi ?? modelApi)
-      : endpointApiForModel(provider, inferredEndpoint, input.api ?? configuredChannelApi);
+      : endpointApiForModel(provider, inferredEndpoint, input.api ?? configuredChannelApi, sourceModel);
     const endpoint = transportOwned && (configuredEntry === undefined || provisionalProviderOnly)
       && (!provisionalProviderOnly || pendingEndpointAutoRepair)
       ? normalizeEndpointForApi(inferredEndpoint, endpointApi)
@@ -569,6 +596,155 @@ export class ModelDoctor {
     return { backupPath: result.backupPath, target: proposal.target, plan: proposal.plan };
   }
 
+  async proposeSetApi(input: SetApiInput): Promise<SetApiProposal> {
+    const requestedProviderId = input.providerId.trim();
+    if (!requestedProviderId || isUnsafeIdentifier(requestedProviderId) || /[\\/]/.test(requestedProviderId)) {
+      throw new DoctorError("Provider id must be a safe non-empty identifier", "invalid-target");
+    }
+    const requestedModelId = input.modelId?.trim();
+    if (input.modelId !== undefined && (!requestedModelId || isUnsafeIdentifier(requestedModelId))) {
+      throw new DoctorError("Model id must be a safe non-empty identifier", "invalid-target");
+    }
+    const endpoint = input.endpoint === undefined ? undefined : input.endpoint.trim();
+    if (input.endpoint !== undefined) {
+      if (!endpoint) throw new DoctorError("Provider endpoint must not be empty", "invalid-target");
+      validateExplicitProviderUrl(endpoint);
+    }
+    if (input.api !== undefined && !isPiApi(input.api)) {
+      throw new DoctorError("API protocol must be a supported Pi API identifier", "invalid-target");
+    }
+    if (input.endpoint === undefined && input.api === undefined && input.apiKey === undefined) {
+      throw new DoctorError("configure requires an endpoint URL, --api, or --api-key", "invalid-target");
+    }
+    const requestedApiKey = input.apiKey?.trim();
+    if (input.apiKey !== undefined && !requestedApiKey) {
+      throw new DoctorError("API key reference must not be empty", "invalid-target");
+    }
+
+    const loadedConfig = await readModelsJson(this.options.paths.modelsPath);
+    const configured = findConfiguredProviderById(getProviders(loadedConfig.data), requestedProviderId);
+    if (!configured) {
+      throw new DoctorError(`Provider ${requestedProviderId} is not configured in models.json`, "invalid-target");
+    }
+    const configuredModels = getModels(configured.provider);
+    const selectedModel = requestedModelId === undefined
+      ? undefined
+      : configuredModels.find((model) => model.id === requestedModelId);
+    if (requestedModelId !== undefined && !selectedModel) {
+      throw new DoctorError(`Model ${configured.id}/${requestedModelId} is not configured in models.json`, "invalid-target");
+    }
+
+    const config = cloneJson(loadedConfig.data);
+    const provider = findConfiguredProviderById(getProviders(config), configured.id)?.provider;
+    if (!provider) throw new DoctorError(`Provider ${configured.id} disappeared while preparing configure`, "invalid-config");
+    const models = getModels(provider);
+    const selectedModelInConfig = selectedModel
+      ? models.find((model) => model.id === selectedModel.id)
+      : undefined;
+    const changes: Change[] = [];
+    const conflicts: Finding[] = [];
+    const warnings: string[] = [];
+
+    if (endpoint !== undefined && !jsonEqual(provider.baseUrl, endpoint)) {
+      changes.push({ path: `providers.${configured.id}.baseUrl`, before: provider.baseUrl, after: endpoint, reason: "Set provider endpoint explicitly", ownership: "user" });
+      provider.baseUrl = endpoint;
+      markExplicitUserField(provider, "baseUrl", this.now(), changes, `providers.${configured.id}._piModelDoctor`);
+    }
+
+    if (input.api !== undefined) {
+      if (selectedModelInConfig) {
+        if (!jsonEqual(selectedModelInConfig.api, input.api)) {
+          changes.push({ path: `providers.${configured.id}.models[${selectedModelInConfig.id}].api`, before: selectedModelInConfig.api, after: input.api, reason: "Set model API protocol explicitly", ownership: "user" });
+          selectedModelInConfig.api = input.api;
+          markExplicitUserField(selectedModelInConfig, "api", this.now(), changes, `providers.${configured.id}.models[${selectedModelInConfig.id}]._piModelDoctor`);
+        }
+      } else {
+        if (!jsonEqual(provider.api, input.api)) {
+          changes.push({ path: `providers.${configured.id}.api`, before: provider.api, after: input.api, reason: "Set provider API protocol explicitly", ownership: "user" });
+          provider.api = input.api;
+          markExplicitUserField(provider, "api", this.now(), changes, `providers.${configured.id}._piModelDoctor`);
+        }
+        for (const model of models) {
+          const apiIsTracked = model._piModelDoctor?.managedFields?.includes("api") === true;
+          const transportOwnedModel = model.compat?.metadataOnly === true || model.compat?.transportOwned === true;
+          const managedApi = hasDoctorMetadata(model)
+            && (transportOwnedModel || (apiIsTracked && canManageField(model, "api")));
+          if (!managedApi) {
+            if (model.api !== undefined && !jsonEqual(model.api, input.api)) {
+              warnings.push(`Preserved user-owned model API ${configured.id}/${model.id}; target it explicitly to change it.`);
+            }
+            continue;
+          }
+          if (!jsonEqual(model.api, input.api)) {
+            changes.push({ path: `providers.${configured.id}.models[${model.id}].api`, before: model.api, after: input.api, reason: "Synchronize managed model API with provider", ownership: "managed" });
+            model.api = input.api;
+          }
+          // Keep the model api managed so later provider-wide configure calls
+          // continue to synchronize it (product intent: continuous sync).
+          // Refresh the managed snapshot even when the value is already equal:
+          // the explicit provider-wide choice must be protected from a later
+          // check/fix regardless of whether this call changed the field.
+          refreshManagedFieldSnapshot(model, "api", this.now(), changes, `providers.${configured.id}.models[${model.id}]._piModelDoctor`);
+        }
+      }
+    }
+
+    if (models.length === 0 && hasDoctorMetadata(provider) && (input.endpoint !== undefined || input.api !== undefined)) {
+      const before = cloneJson(provider._piModelDoctor);
+      const after = cloneJson(provider._piModelDoctor);
+      after.endpointNormalizationPending = false;
+      after.endpointNormalizationBlocked = false;
+      after.endpointApiNormalizationBlocked = false;
+      delete after.endpointValueHint;
+      delete after.endpointApiHint;
+      if (input.api !== undefined) after.endpointApiExplicit = true;
+      if (!jsonEqual(before, after)) {
+        provider._piModelDoctor = after;
+        changes.push({ path: `providers.${configured.id}._piModelDoctor`, before, after, reason: "Record explicit provider transport configuration", ownership: "managed" });
+      }
+    }
+
+    if (requestedApiKey !== undefined) {
+      if (isCredentialReference(requestedApiKey) || input.allowLiteralApiKey === true) {
+        if (!jsonEqual(provider.apiKey, requestedApiKey)) {
+          changes.push({ path: `providers.${configured.id}.apiKey`, before: provider.apiKey, after: "[redacted]", reason: "Set provider authentication reference explicitly", ownership: "user" });
+          provider.apiKey = requestedApiKey;
+        }
+        if (!isCredentialReference(requestedApiKey)) {
+          warnings.push("A literal API key was explicitly allowed and will be persisted; review the backup and configure a safer auth reference when possible.");
+        }
+      } else {
+        warnings.push("Literal API key input was not persisted; use $ENV_VAR, ${ENV_VAR}, !command, or explicitly opt in with --allow-literal-api-key.");
+      }
+    }
+
+    const plan = sanitizePlan({ target: requestedModelId ? `${configured.id}/${requestedModelId}` : configured.id, changes, conflicts, warnings });
+    return {
+      target: plan.target,
+      providerId: configured.id,
+      modelId: requestedModelId,
+      modelIds: requestedModelId ? [requestedModelId] : configuredModels.map((model) => model.id),
+      config: plan.changes.length === 0 ? cloneJson(loadedConfig.data) : config,
+      baseFingerprint: loadedConfig.fingerprint,
+      baseExisted: loadedConfig.existed,
+      plan,
+      warning: warnings.length > 0 ? [...new Set(warnings)].join(" ") : undefined,
+      dryRun: input.dryRun,
+    };
+  }
+
+  async applySetApi(proposal: SetApiProposal): Promise<{ backupPath?: string; plan: ChangePlan }> {
+    if (proposal.dryRun) return { plan: proposal.plan };
+    const blocking = proposal.plan.conflicts.filter((item) => item.severity === "error");
+    if (blocking.length > 0) {
+      throw new DoctorError(`Cannot set API for ${proposal.target}: ${blocking.map((item) => item.message).join("; ")}`, "invalid-config");
+    }
+    if (proposal.plan.changes.length === 0) return { plan: proposal.plan };
+    await this.ensureProposalBaseUnchanged(proposal.baseFingerprint, proposal.baseExisted);
+    const result = await writeModelsJson(this.options.paths.modelsPath, proposal.config, this.now());
+    return { backupPath: result.backupPath, plan: proposal.plan };
+  }
+
   async proposeSync(input: SyncInput): Promise<SyncProposal> {
     const target = input.target.trim();
     validateAddTarget(target);
@@ -624,6 +800,7 @@ export class ModelDoctor {
       const add = await this.proposeAdd({
         target,
         modelId,
+        requireConfiguredProvider: false,
         metadataProvider,
         api: input.api,
         apiKey: input.apiKey,
@@ -1188,19 +1365,22 @@ function mismatchCode(field: string): FindingCode {
 function mergeModel(providerId: string, existing: PiModel, desired: PiModel, changes: Change[], conflicts: Finding[], now: Date, options: { preserveTransport?: boolean } = {}): void {
   const managedFields: string[] = [];
   const removedFields = new Set<string>();
+  const reclaimedExplicitFields = new Set<string>();
   for (const field of ["name", "api", "reasoning", "thinkingLevelMap", "input", "cost", "contextWindow", "maxTokens", "compat"] as const) {
     if (options.preserveTransport && field === "api") continue;
     const value = desired[field];
+    const explicitField = isExplicitField(existing, field);
     if (value === undefined) {
-      if (field in existing && canManageField(existing, field)) {
+      if (!explicitField && field in existing && canManageField(existing, field)) {
         changes.push({ path: `model.${existing.id}.${field}`, before: existing[field], after: undefined, reason: `Remove stale ${field} from models.dev`, ownership: "managed" });
         delete (existing as Record<string, unknown>)[field];
         removedFields.add(field);
       }
       continue;
     }
-    if (canManageField(existing, field)) {
+    if (canManageField(existing, field) && (!explicitField || jsonEqual(existing[field], value))) {
       managedFields.push(field);
+      if (explicitField) reclaimedExplicitFields.add(field);
       if (!jsonEqual(existing[field], value)) {
         changes.push({ path: `model.${existing.id}.${field}`, before: existing[field], after: value, reason: `Sync ${field} from models.dev`, ownership: "managed" });
         (existing as Record<string, unknown>)[field] = cloneJson(value);
@@ -1216,12 +1396,75 @@ function mergeModel(providerId: string, existing: PiModel, desired: PiModel, cha
       next.managedFields = (next.managedFields ?? []).filter((managedField) => managedField !== field);
       if (next.managedValues) delete next.managedValues[field];
     }
+    if (reclaimedExplicitFields.size > 0 && next.explicitFields) {
+      next.explicitFields = next.explicitFields.filter((field) => !reclaimedExplicitFields.has(field));
+      if (next.explicitFields.length === 0) delete next.explicitFields;
+    }
     if (options.preserveTransport) next = withoutManagedFields(next, ["api"]);
     if (!jsonEqual(previous, next)) {
       existing._piModelDoctor = next;
       changes.push({ path: `model.${existing.id}._piModelDoctor`, before: previous, after: next, reason: "Record model ownership metadata", ownership: "managed" });
     }
   }
+}
+
+function markExplicitUserField(
+  value: JsonObject,
+  field: string,
+  now: Date,
+  changes: Change[],
+  metadataPath: string,
+): void {
+  if (!hasDoctorMetadata(value) || !value._piModelDoctor.managedFields?.includes(field)) return;
+  const before = cloneJson(value._piModelDoctor);
+  const after = cloneJson(value._piModelDoctor);
+  after.lastCheck = now.toISOString();
+  after.managedFields = (after.managedFields ?? []).filter((managedField) => managedField !== field);
+  if (after.managedValues) delete after.managedValues[field];
+  // Once a field becomes user-owned it must no longer claim to be an explicit
+  // configured field; otherwise check/fix would still consult a marker that
+  // no longer corresponds to a managed field.
+  if (after.explicitFields) {
+    after.explicitFields = after.explicitFields.filter((explicitField) => explicitField !== field);
+    if (after.explicitFields.length === 0) delete after.explicitFields;
+  }
+  if (jsonEqual(before, after)) return;
+  value._piModelDoctor = after;
+  changes.push({ path: metadataPath, before, after, reason: `Record explicit ${field} update as user-owned`, ownership: "managed" });
+}
+
+/**
+ * Keep a doctor-managed field managed while recording a new value written by
+ * configure synchronization. The field stays in managedFields and its managed
+ * snapshot is refreshed to the new value so canManageField remains true and
+ * later provider-wide configure calls keep synchronizing it. Only fields that
+ * are currently managed are touched; user-owned fields are never re-tracked.
+ */
+function refreshManagedFieldSnapshot(
+  value: JsonObject,
+  field: string,
+  now: Date,
+  changes: Change[],
+  metadataPath: string,
+): void {
+  if (!hasDoctorMetadata(value) || value._piModelDoctor.managedFields?.includes(field) !== true) return;
+  const metadata = value._piModelDoctor;
+  const alreadyExplicit = metadata.explicitFields?.includes(field) === true;
+  const snapshotMatches = isRecord(metadata.managedValues)
+    && field in metadata.managedValues
+    && jsonEqual(metadata.managedValues[field], value[field]);
+  if (alreadyExplicit && snapshotMatches) return;
+  const before = cloneJson(metadata);
+  const after = cloneJson(metadata);
+  after.lastCheck = now.toISOString();
+  after.managedValues = { ...(after.managedValues ?? {}) };
+  after.managedValues[field] = cloneJson(value[field]);
+  // Record the explicitly chosen protocol so check/fix never auto-reverts it.
+  after.explicitFields = [...(after.explicitFields ?? [])];
+  if (!after.explicitFields.includes(field)) after.explicitFields.push(field);
+  if (jsonEqual(before, after)) return;
+  value._piModelDoctor = after;
+  changes.push({ path: metadataPath, before, after, reason: `Refresh managed ${field} snapshot and record explicit field after configure`, ownership: "managed" });
 }
 
 function applyRepairPlan(config: PiModelsJson, target: string, catalog: ModelsDevCatalog, findings: Finding[], now: Date, source: string, policy: PolicyCatalog): ChangePlan {
@@ -1301,7 +1544,7 @@ function applyRepairPlan(config: PiModelsJson, target: string, catalog: ModelsDe
       continue;
     }
     if (transportOwned && field === "api") continue;
-    if (canManageField(model, field)) {
+    if (canManageField(model, field) && !isExplicitField(model, field)) {
       if (!jsonEqual(model[field], value)) {
         changes.push({ path: `providers.${providerId}.models[${selected.modelId}].${field}`, before: model[field], after: value, reason: `Repair ${field} from models.dev`, ownership: "managed" });
         (model as Record<string, unknown>)[field] = cloneJson(value);
@@ -1494,7 +1737,7 @@ function checkModel(providerId: string, provider: PiProvider, model: PiModel, so
   }
   const expectedReasoning = resolveReasoning(sourceProvider, sourceModel);
   if (!transportOwned && model.api !== expectedApi) {
-    const repairable = canManageField(model, "api");
+    const repairable = canManageField(model, "api") && !isExplicitField(model, "api");
     findings.push(finding("api-mismatch", "warning", target, `Configured model API is ${model.api ?? "unset"}; expected ${expectedApi}`, repairable, !repairable));
   }
   if (expectedModel.input && !jsonEqual(model.input, expectedModel.input)) {
@@ -1753,10 +1996,7 @@ function managedSnapshotValues(value: Record<string, unknown>, fields: Set<strin
 }
 
 function isPiApi(value: unknown): value is PiApi {
-  return value === "openai-completions"
-    || value === "openai-responses"
-    || value === "anthropic-messages"
-    || value === "google-generative-ai";
+  return typeof value === "string" && (PI_API_OPTIONS as readonly string[]).includes(value);
 }
 
 function detectConfiguredChannelApi(provider: PiProvider, model: PiModel, endpoint?: string, metadataProvider?: ModelsDevProvider): PiApi {
@@ -1767,7 +2007,7 @@ function detectConfiguredChannelApi(provider: PiProvider, model: PiModel, endpoi
     && metadata?.endpointApiHint !== undefined
     && provider.api !== metadata.endpointApiHint;
   const explicitApi = isPiApi(model.api) ? model.api : (pendingInference && !inferredApiWasUserChanged) ? undefined : isPiApi(provider.api) ? provider.api : undefined;
-  return explicitApi ?? endpointApiForModel(metadataProvider, endpoint) ?? detectChannelApi(endpoint);
+  return explicitApi ?? endpointApiForModel(metadataProvider, endpoint, undefined, model) ?? detectChannelApi(endpoint, undefined, model);
 }
 
 function isSatisfiedByProviderAuth(header: string, provider: PiProvider): boolean {
@@ -1852,12 +2092,14 @@ function compatCacheDiffers(left: PiModel["compat"], right: PiModel["compat"]): 
 }
 
 function findConfiguredProvider(providers: Record<string, PiProvider>, target: string): { id: string; provider: PiProvider } | undefined {
-  const normalized = normalizeIdentifier(target);
-  const entry = Object.entries(providers).find(([id, provider]) => [id, provider.name]
-    .filter((value): value is string => typeof value === "string")
-    .some((value) => normalizeIdentifier(value) === normalized)
-    || looksLikeUrl(target) && typeof provider.baseUrl === "string" && sameChannelEndpoint(provider.baseUrl, target, provider.api));
-  return entry ? { id: entry[0], provider: entry[1] } : undefined;
+  // Id/name lookup stays ambiguity-safe like findConfiguredProviderById: a
+  // case-folded or name collision must not silently pick the first entry.
+  const byId = findConfiguredProviderById(providers, target);
+  if (byId) return byId;
+  if (!looksLikeUrl(target)) return undefined;
+  const urlMatches = Object.entries(providers).filter(([, provider]) =>
+    typeof provider.baseUrl === "string" && sameChannelEndpoint(provider.baseUrl, target, provider.api));
+  return urlMatches.length === 1 ? { id: urlMatches[0][0], provider: urlMatches[0][1] } : undefined;
 }
 
 function findConfiguredProviderById(providers: Record<string, PiProvider>, target: string): { id: string; provider: PiProvider } | undefined {
@@ -1865,6 +2107,9 @@ function findConfiguredProviderById(providers: Record<string, PiProvider>, targe
   const entries = Object.entries(providers).filter(([id, provider]) => [id, provider.name]
     .filter((value): value is string => typeof value === "string")
     .some((value) => normalizeIdentifier(value) === normalized));
+  // Case-folded discovery may match multiple case variants or a name that
+  // collides with another storage id; ambiguous references stay unresolved and
+  // callers report the target as not configured rather than guessing.
   return entries.length === 1 ? { id: entries[0][0], provider: entries[0][1] } : undefined;
 }
 

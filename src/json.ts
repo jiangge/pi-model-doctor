@@ -115,6 +115,15 @@ export function hasDoctorMetadata(value: unknown): value is JsonObject & { _piMo
   return isRecord(value) && isRecord(value._piModelDoctor) && value._piModelDoctor.managed === true;
 }
 
+export function isExplicitField(value: unknown, field: string): boolean {
+  // A field explicitly set via configure stays managed for continuous
+  // provider-wide synchronization, but is protected from auto-repair
+  // (check/fix must not revert the user's explicit protocol choice).
+  return isRecord(value) && isRecord(value._piModelDoctor)
+    && Array.isArray(value._piModelDoctor.explicitFields)
+    && value._piModelDoctor.explicitFields.includes(field);
+}
+
 export function canManageField(value: JsonObject, field: string): boolean {
   const hasValue = field in value && value[field] !== undefined;
   const metadata = value._piModelDoctor;
