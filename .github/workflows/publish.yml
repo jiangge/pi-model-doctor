@@ -45,5 +45,10 @@ jobs:
       - name: Publish
         # Auth is provided by npm Trusted Publishing (OIDC) via the
         # id-token: write permission, so no npm token is required.
+        # actions/setup-node injects a default NODE_AUTH_TOKEN when
+        # registry-url is set; clear it so npm uses OIDC instead of that
+        # (otherwise npm returns 404 "not in this registry").
         # `--provenance` also attaches a signed build provenance.
         run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ""
