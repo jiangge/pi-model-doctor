@@ -1,6 +1,6 @@
 {
   "name": "pi-model-doctor",
-  "version": "0.1.6",
+  "version": "0.2.0",
   "type": "module",
   "description": "Safe lifecycle management for Pi models.json using models.dev metadata.",
   "author": "jiangge",
