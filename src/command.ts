@@ -230,6 +230,129 @@ function parseModelIdsFlag(value: string | boolean | undefined): string[] {
   return modelIds;
 }
 
+/** Models shown per page in the interactive sync selector. */
+const SYNC_PAGE_SIZE = 10;
+
+type SyncPickAction = "toggle" | "select-all" | "invert" | "clear" | "search" | "next" | "prev" | "done";
+
+interface SyncPickOption {
+  key: string;
+  label: string;
+  action: SyncPickAction;
+  candidate?: ModelCandidate;
+}
+
+function syncCandidateIdentity(candidate: ModelCandidate): string {
+  return `${candidate.providerId}/${candidate.id}`;
+}
+
+/**
+ * Paged, searchable, multi-select model picker built on top of the single
+ * `select`/`input` dialogs. Supports toggling individual models, selecting all
+ * (or inverting) the search-filtered set, clearing the selection, paging
+ * through large candidate lists, and finishing with Done (or Esc to cancel).
+ *
+ * Returns the selected candidates in original catalog order, or undefined when
+ * the user cancels.
+ */
+async function selectModelsInteractively(
+  ctx: ExtensionCommandContext,
+  title: string,
+  candidates: ModelCandidate[],
+): Promise<ModelCandidate[] | undefined> {
+  const selected = new Set<string>();
+  let search = "";
+  let page = 0;
+
+  while (true) {
+    const needle = search.trim().toLowerCase();
+    const filtered = needle
+      ? candidates.filter((candidate) => `${candidate.providerId} ${candidate.id} ${candidate.name ?? ""}`.toLowerCase().includes(needle))
+      : candidates.slice();
+    const pageCount = Math.max(1, Math.ceil(filtered.length / SYNC_PAGE_SIZE));
+    page = Math.min(Math.max(0, page), pageCount - 1);
+    const start = page * SYNC_PAGE_SIZE;
+    const pageItems = filtered.slice(start, start + SYNC_PAGE_SIZE);
+
+    const options: SyncPickOption[] = [];
+    for (const candidate of pageItems) {
+      const identity = syncCandidateIdentity(candidate);
+      const mark = selected.has(identity) ? "[x]" : "[ ]";
+      const details = [
+        candidate.name ? `(${candidate.name})` : undefined,
+        candidate.metadataOnly ? "[metadata-only]" : undefined,
+        candidate.deprecated ? "[deprecated]" : undefined,
+      ].filter(Boolean).join(" ");
+      options.push({
+        key: `toggle:${identity}`,
+        label: redactSensitiveText(`${mark} ${candidate.providerId}/${candidate.id}${details ? ` ${details}` : ""}`),
+        action: "toggle",
+        candidate,
+      });
+    }
+
+    const selectedInFilter = filtered.filter((candidate) => selected.has(syncCandidateIdentity(candidate))).length;
+    if (filtered.length > 0) {
+      options.push({ key: "action:select-all", label: `Select all (${filtered.length} matching)`, action: "select-all" });
+      options.push({ key: "action:invert", label: `Invert selection (${selectedInFilter}/${filtered.length} matching selected)`, action: "invert" });
+    }
+    if (selected.size > 0) {
+      options.push({ key: "action:clear", label: `Clear selection (${selected.size} total)`, action: "clear" });
+    }
+    options.push({ key: "action:search", label: search ? `Search… (current: "${search}")` : "Search…", action: "search" });
+    if (pageCount > 1) {
+      if (page < pageCount - 1) options.push({ key: "action:next", label: `Next page (${page + 1}/${pageCount})`, action: "next" });
+      if (page > 0) options.push({ key: "action:prev", label: `Previous page (${page + 1}/${pageCount})`, action: "prev" });
+    }
+    options.push({ key: "action:done", label: `Done (${selected.size} selected)`, action: "done" });
+
+    const prompt = `${title} — ${selected.size} selected, ${filtered.length} matching`;
+    const choices = options.map((option) => option.label);
+    const choice = await ctx.ui.select(prompt, choices);
+    if (!choice) return undefined;
+    const chosenIndex = choices.indexOf(choice);
+    const chosen = chosenIndex >= 0 ? options[chosenIndex] : undefined;
+    if (!chosen) continue;
+
+    switch (chosen.action) {
+      case "toggle": {
+        if (!chosen.candidate) break;
+        const identity = syncCandidateIdentity(chosen.candidate);
+        if (selected.has(identity)) selected.delete(identity);
+        else selected.add(identity);
+        break;
+      }
+      case "select-all":
+        for (const candidate of filtered) selected.add(syncCandidateIdentity(candidate));
+        break;
+      case "invert":
+        for (const candidate of filtered) {
+          const identity = syncCandidateIdentity(candidate);
+          if (selected.has(identity)) selected.delete(identity);
+          else selected.add(identity);
+        }
+        break;
+      case "clear":
+        selected.clear();
+        break;
+      case "search": {
+        const term = await ctx.ui.input("Search models (empty clears)", search ? `current: ${search}` : "model id or name substring");
+        search = term === undefined ? search : term.trim();
+        page = 0;
+        break;
+      }
+      case "next":
+        page += 1;
+        break;
+      case "prev":
+        page -= 1;
+        break;
+      case "done":
+        return candidates.filter((candidate) => selected.has(syncCandidateIdentity(candidate)));
+    }
+  }
+}
+
 async function runSync(args: string[], flags: Record<string, string | boolean>, ctx: ExtensionCommandContext, doctor: ModelDoctor): Promise<void> {
   const target = args[0];
   if (!target) throw new DoctorError(`Usage: /model-doctor sync <provider-or-url> [--models <id1,id2>] [--metadata-provider <models.dev-provider>] [--api ${PI_API_FLAG_USAGE}] [--api-key <reference>] [--allow-literal-api-key] [--dry-run] [--yes]`, "invalid-target");
@@ -241,22 +364,10 @@ async function runSync(args: string[], flags: Record<string, string | boolean>, 
   if (modelIds.length === 0 && ctx.hasUI) {
     const candidates = await doctor.listCandidates(target, false, undefined, metadataProvider);
     if (candidates.length === 0) throw new DoctorError(`No models.dev models found for ${target}; provide --models <id1,id2>`, "invalid-target");
-    const remaining = [...candidates];
-    const selected: ModelCandidate[] = [];
-    while (remaining.length > 0) {
-      const doneLabel = `Done (${selected.length} selected)`;
-      const choices = [...remaining.map((candidate, index) => formatCandidateLabel(candidate, index)), doneLabel];
-      const choice = await ctx.ui.select(`Select models to sync for ${redactSensitiveText(target)}; choose Done when finished`, choices);
-      if (!choice) {
-        ctx.ui.notify("Sync cancelled. Status: not-persisted; models.json was not changed.", "info");
-        return;
-      }
-      if (choice === doneLabel) break;
-      const selectedIndex = choices.indexOf(choice);
-      const candidate = selectedIndex >= 0 ? remaining[selectedIndex] : undefined;
-      if (!candidate) throw new DoctorError("The selected model is no longer available; retry model discovery", "invalid-target");
-      selected.push(candidate);
-      remaining.splice(selectedIndex, 1);
+    const selected = await selectModelsInteractively(ctx, `Select models to sync for ${redactSensitiveText(target)}`, candidates);
+    if (!selected || selected.length === 0) {
+      ctx.ui.notify("Sync cancelled. Status: not-persisted; models.json was not changed.", "info");
+      return;
     }
     const metadataProviders = new Set(selected.filter((candidate) => candidate.metadataOnly).map((candidate) => candidate.providerId));
     if (!metadataProvider && metadataProviders.size === 1) {
@@ -265,10 +376,6 @@ async function runSync(args: string[], flags: Record<string, string | boolean>, 
       metadataProvider = [...metadataProviders][0];
     }
     modelIds = [...new Set(selected.map((candidate) => candidate.id))];
-    if (modelIds.length === 0) {
-      ctx.ui.notify("Sync cancelled. Status: not-persisted; models.json was not changed.", "info");
-      return;
-    }
   }
   if (modelIds.length === 0) throw new DoctorError("Model selection is required; use --models <id1,id2> in non-interactive mode", "selection-required");
   ensureHeadlessAuthorization(ctx, flags, "sync", dryRun);

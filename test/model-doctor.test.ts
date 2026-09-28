@@ -757,14 +757,17 @@ test("interactive sync selects several models and supports Done", async () => {
   });
   const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(multiCatalog) } });
   const notifications: string[] = [];
+  const picks = ["gpt-one", "gpt-two", "Done"];
   let selections = 0;
   const ctx = {
     hasUI: true,
     ui: {
       notify: (message: string) => notifications.push(message),
       select: async (_prompt: string, choices: string[]) => {
+        const target = picks[Math.min(selections, picks.length - 1)];
         selections += 1;
-        return selections <= 2 ? choices[0] : choices.at(-1);
+        // Toggle each model by its label, then finish with the Done action.
+        return choices.find((choice) => choice.includes(target)) ?? choices.at(-1);
       },
       confirm: async () => true,
     },
@@ -806,6 +809,71 @@ test("interactive sync cancellation after selection does not write", async () =>
   assert.match(notifications.at(-1) ?? "", /Sync cancelled.*not-persisted/s);
   await assert.rejects(() => readFile(targetPaths.modelsPath));
   assert.equal((await readdir(root)).some((file) => file.startsWith("models.json.bak-")), false);
+});
+
+test("interactive sync supports select-all and search filtering", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-sync-select-all-"));
+  const targetPaths = paths(root);
+  const multiCatalog = normalizeCatalog({
+    openai: {
+      id: "openai",
+      api: "https://api.openai.com/v1",
+      models: {
+        "gpt-alpha": { id: "gpt-alpha" },
+        "gpt-beta": { id: "gpt-beta" },
+        "claude-inbox": { id: "claude-inbox" },
+      },
+    },
+  });
+  const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(multiCatalog) } });
+  const notifications: string[] = [];
+  let selections = 0;
+  const ctx = {
+    hasUI: true,
+    ui: {
+      notify: (message: string) => notifications.push(message),
+      input: async () => "gpt",
+      select: async (_prompt: string, choices: string[]) => {
+        selections += 1;
+        if (selections === 1) return choices.find((choice) => choice.includes("Search")) ?? choices.at(-1);
+        if (selections === 2) return choices.find((choice) => choice.includes("Select all")) ?? choices.at(-1);
+        return choices.find((choice) => choice.includes("Done")) ?? choices.at(-1);
+      },
+      confirm: async () => true,
+    },
+  } as never;
+  await runCommand("sync openai", ctx, doctor);
+  const saved = await readModelsJson(targetPaths.modelsPath);
+  // Only the gpt-* models match the "gpt" search and are selected.
+  assert.deepEqual(saved.data.providers?.openai?.models?.map((model) => model.id), ["gpt-alpha", "gpt-beta"]);
+});
+
+test("interactive sync paginates large candidate lists", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-sync-paginate-"));
+  const targetPaths = paths(root);
+  const modelIds = Array.from({ length: 15 }, (_, index) => `model-${String(index + 1).padStart(2, "0")}`);
+  const models: Record<string, { id: string }> = Object.fromEntries(modelIds.map((id) => [id, { id }]));
+  const largeCatalog = normalizeCatalog({ openai: { id: "openai", api: "https://api.openai.com/v1", models } });
+  const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(largeCatalog) } });
+  const notifications: string[] = [];
+  let selections = 0;
+  const ctx = {
+    hasUI: true,
+    ui: {
+      notify: (message: string) => notifications.push(message),
+      select: async (_prompt: string, choices: string[]) => {
+        selections += 1;
+        if (selections === 1) return choices.find((choice) => choice.includes("Next page")) ?? choices.at(-1);
+        if (selections === 2) return choices.find((choice) => choice.includes("model-15")) ?? choices.at(-1);
+        return choices.find((choice) => choice.includes("Done")) ?? choices.at(-1);
+      },
+      confirm: async () => true,
+    },
+  } as never;
+  await runCommand("sync openai", ctx, doctor);
+  const saved = await readModelsJson(targetPaths.modelsPath);
+  // Only model-15 (on the second page) was selected.
+  assert.deepEqual((saved.data.providers?.openai?.models ?? []).map((model) => model.id), ["model-15"]);
 });
 
 test("adds a provider-only entry when a URL is given without a model id", async () => {
