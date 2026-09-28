@@ -23,6 +23,13 @@ jobs:
           node-version: 22
           registry-url: "https://registry.npmjs.org"
 
+      # npm's OIDC trusted-publishing token exchange shipped in 11.5.x; Node 22
+      # bundles npm 10 which silently publishes unauthenticated (=> 404).
+      - name: Ensure npm supports OIDC trusted publishing
+        run: |
+          npm install -g npm@^11.5.1
+          npm --version
+
       - name: Install dependencies
         run: npm ci
 
