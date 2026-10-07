@@ -642,13 +642,17 @@ test("interactive add resolves ambiguous metadata providers through a picker ins
     aihubmix: { id: "aihubmix", api: "https://api.aihubmix.example/v1", models: { "glm-shared": { id: "glm-shared", limit: { context: 64000 } } } },
   });
   const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(ambiguousCatalog) } });
-  const notifications: string[] = [];
+  const notifications: { message: string; level: string }[] = [];
   const ctx = {
     hasUI: true,
     ui: {
-      notify: (message: string) => notifications.push(message),
+      notify: (message: string, level: string) => notifications.push({ message, level }),
       // The disambiguation picker lists metadata-provider candidates; pick the zai entry.
-      select: async (_prompt: string, choices: string[]) => choices.find((choice) => /\bzai\b/.test(choice)) ?? choices.at(-1),
+      select: async (_prompt: string, choices: string[]) => {
+        const picked = choices.find((choice) => /zai\/glm-shared/.test(choice));
+        if (!picked) throw new Error(`expected zai candidate in picker, got: ${choices.join(" | ")}`);
+        return picked;
+      },
       confirm: async () => true,
     },
   } as never;
@@ -656,10 +660,10 @@ test("interactive add resolves ambiguous metadata providers through a picker ins
   const saved = await readModelsJson(targetPaths.modelsPath);
   assert.equal(saved.data.providers?.channel?.models?.[0]?.id, "glm-shared");
   assert.equal(saved.data.providers?.channel?.models?.[0]?.contextWindow, 128000);
-  assert.equal(notifications.some((message) => /Metadata provider: zai/.test(message)), true);
+  assert.equal(notifications.some((entry) => /Metadata provider: zai/.test(entry.message)), true);
 });
 
-test("interactive add disambiguation cancellation is not-persisted", async () => {
+test("interactive add disambiguation cancellation reports one info notification and writes nothing", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-add-disambiguate-cancel-"));
   const targetPaths = paths(root);
   const before = JSON.stringify({ providers: { channel: { baseUrl: "https://channel.example/v1", api: "openai-completions", models: [] } } }, null, 2);
@@ -669,19 +673,170 @@ test("interactive add disambiguation cancellation is not-persisted", async () =>
     aihubmix: { id: "aihubmix", api: "https://api.aihubmix.example/v1", models: { "glm-shared": { id: "glm-shared" } } },
   });
   const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(ambiguousCatalog) } });
-  const notifications: string[] = [];
+  const notifications: { message: string; level: string }[] = [];
   const ctx = {
     hasUI: true,
     ui: {
-      notify: (message: string) => notifications.push(message),
+      notify: (message: string, level: string) => notifications.push({ message, level }),
       select: async () => undefined,
       confirm: async () => true,
     },
   } as never;
   await runCommand("add channel glm-shared", ctx, doctor);
-  assert.match(notifications.at(-1) ?? "", /Add cancelled.*not-persisted/s);
+  // Cancellation is a single info notification, never an error-level one.
+  const cancellations = notifications.filter((entry) => /Add cancelled/.test(entry.message));
+  assert.equal(cancellations.length, 1);
+  assert.equal(cancellations[0]?.level, "info");
+  assert.equal(notifications.some((entry) => entry.level === "error"), false);
   assert.equal(await readFile(targetPaths.modelsPath, "utf8"), before);
   assert.equal((await readdir(root)).some((file) => file.startsWith("models.json.bak-")), false);
+  const doctorDirEntries = await readdir(targetPaths.doctorDir).catch(() => []);
+  assert.equal(doctorDirEntries.length, 0, "cancellation must not persist catalog caches");
+});
+
+test("interactive add --dry-run with disambiguation writes no config, backup, or cache", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-add-disambiguate-dryrun-"));
+  const targetPaths = paths(root);
+  const before = JSON.stringify({ providers: { channel: { baseUrl: "https://channel.example/v1", api: "openai-completions", models: [] } } }, null, 2);
+  await writeFile(targetPaths.modelsPath, before);
+  const ambiguousCatalog = normalizeCatalog({
+    zai: { id: "zai", api: "https://api.zai.example/v1", models: { "glm-shared": { id: "glm-shared", limit: { context: 128000 } } } },
+    aihubmix: { id: "aihubmix", api: "https://api.aihubmix.example/v1", models: { "glm-shared": { id: "glm-shared", limit: { context: 64000 } } } },
+  });
+  const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(ambiguousCatalog) } });
+  const notifications: { message: string; level: string }[] = [];
+  const ctx = {
+    hasUI: true,
+    ui: {
+      notify: (message: string, level: string) => notifications.push({ message, level }),
+      select: async (_prompt: string, choices: string[]) => {
+        const picked = choices.find((choice) => /aihubmix\/glm-shared/.test(choice));
+        if (!picked) throw new Error(`expected aihubmix candidate in picker, got: ${choices.join(" | ")}`);
+        return picked;
+      },
+      confirm: async () => true,
+    },
+  } as never;
+  await runCommand("add channel glm-shared --dry-run", ctx, doctor);
+  assert.match(notifications.at(-1)?.message ?? "", /not-persisted \(dry-run\)/);
+  assert.equal(await readFile(targetPaths.modelsPath, "utf8"), before);
+  assert.equal((await readdir(root)).some((file) => file.startsWith("models.json.bak-")), false);
+  const doctorDirEntries = await readdir(targetPaths.doctorDir).catch(() => []);
+  assert.equal(doctorDirEntries.length, 0, "dry-run must not persist catalog caches");
+});
+
+test("--metadata-provider resolves an endpoint shared by multiple catalog providers", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-shared-endpoint-ambiguous-"));
+  const targetPaths = paths(root);
+  const sharedCatalog = normalizeCatalog({
+    a: { id: "a", api: "https://shared.example/v1", models: { m: { id: "m", limit: { context: 111000 } } } },
+    b: { id: "b", api: "https://shared.example/v1", models: { m: { id: "m", limit: { context: 222000 } } } },
+  });
+  const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(sharedCatalog) } });
+  // Without disambiguation the error must list both tied providers and tell
+  // the user how to resolve the tie; the flag must then actually resolve it
+  // instead of leading back to the same failure.
+  let rejection: unknown;
+  await assert.rejects(
+    () => doctor.proposeAdd({ target: "https://shared.example/v1", providerId: "ch", modelId: "m", persistCache: false }),
+    (error: unknown) => {
+      rejection = error;
+      return error instanceof DoctorError && error.code === "selection-required";
+    },
+  );
+  const selectionError = rejection as DoctorError;
+  assert.match(selectionError.message, /--metadata-provider/);
+  assert.deepEqual(
+    selectionError.selectionCandidates.map((candidate) => candidate.providerId),
+    ["a", "b"],
+  );
+  const resolved = await doctor.proposeAdd({ target: "https://shared.example/v1", providerId: "ch", modelId: "m", metadataProvider: "a", persistCache: false });
+  assert.equal(resolved.metadataProviderId, "a");
+  assert.equal(resolved.config.providers?.ch?.models?.[0]?.contextWindow, 111000);
+});
+
+test("interactive add resolves a shared-endpoint tie through the picker", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-shared-endpoint-picker-"));
+  const targetPaths = paths(root);
+  const sharedCatalog = normalizeCatalog({
+    a: { id: "a", api: "https://shared.example/v1", models: { m: { id: "m", limit: { context: 111000 } } } },
+    b: { id: "b", api: "https://shared.example/v1", models: { m: { id: "m", limit: { context: 222000 } } } },
+  });
+  const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(sharedCatalog) } });
+  const ctx = {
+    hasUI: true,
+    ui: {
+      notify: () => undefined,
+      select: async (_prompt: string, choices: string[]) => {
+        const picked = choices.find((choice) => /b\/m/.test(choice));
+        if (!picked) throw new Error(`expected b candidate in picker, got: ${choices.join(" | ")}`);
+        return picked;
+      },
+      confirm: async () => true,
+    },
+  } as never;
+  await runCommand("add ch https://shared.example/v1 m --yes", ctx, doctor);
+  const saved = await readModelsJson(targetPaths.modelsPath);
+  assert.equal(saved.data.providers?.ch?.models?.[0]?.id, "m");
+  assert.equal(saved.data.providers?.ch?.models?.[0]?.contextWindow, 222000);
+});
+
+test("global name ties list each provider's real model id in candidates", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-name-tie-"));
+  const targetPaths = paths(root);
+  await writeFile(targetPaths.modelsPath, JSON.stringify({
+    providers: { channel: { baseUrl: "https://channel.example/v1", api: "openai-completions", models: [] } },
+  }, null, 2));
+  const nameTieCatalog = normalizeCatalog({
+    p1: { id: "p1", api: "https://p1.example/v1", models: { "x-1": { id: "x-1", name: "Foo" } } },
+    p2: { id: "p2", api: "https://p2.example/v1", models: { "y-2": { id: "y-2", name: "Foo" } } },
+  });
+  const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(nameTieCatalog) } });
+  let rejection: unknown;
+  await assert.rejects(
+    () => doctor.proposeAdd({ target: "channel", modelId: "Foo", requireConfiguredProvider: true, persistCache: false }),
+    (error: unknown) => {
+      rejection = error;
+      return error instanceof DoctorError && error.code === "selection-required";
+    },
+  );
+  const selectionError = rejection as DoctorError;
+  assert.deepEqual(
+    selectionError.selectionCandidates.map((candidate) => `${candidate.providerId}/${candidate.modelId}`).sort(),
+    ["p1/x-1", "p2/y-2"],
+  );
+});
+
+test("provider-internal model ambiguity asks for an exact model id without metadata candidates", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-internal-ambiguous-"));
+  const targetPaths = paths(root);
+  const internalCatalog = normalizeCatalog({
+    p: {
+      id: "p",
+      api: "https://p.example/v1",
+      models: {
+        "x-1": { id: "x-1", name: "Foo", limit: { context: 1000 } },
+        "y-2": { id: "y-2", name: "Foo", limit: { context: 2000 } },
+      },
+    },
+  });
+  await writeFile(targetPaths.modelsPath, JSON.stringify({
+    providers: { p: { baseUrl: "https://p.example/v1", api: "openai-completions", models: [] } },
+  }, null, 2));
+  const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(internalCatalog) } });
+  let rejection: unknown;
+  await assert.rejects(
+    () => doctor.proposeAdd({ target: "p", modelId: "Foo", requireConfiguredProvider: true, persistCache: false }),
+    (error: unknown) => {
+      rejection = error;
+      return error instanceof DoctorError && error.code === "selection-required";
+    },
+  );
+  const selectionError = rejection as DoctorError;
+  // --metadata-provider cannot resolve a tie inside a single provider.
+  assert.doesNotMatch(selectionError.message, /--metadata-provider/);
+  assert.match(selectionError.message, /choose an exact model id/);
+  assert.equal(selectionError.selectionCandidates.length, 0);
 });
 
 test("preserves third-party headers and credentials while adding metadata-only models", async () => {

@@ -37,7 +37,7 @@ The extension crosses three failure-prone boundaries: user command input, local 
 | `add <provider-id> <endpoint-url> <model>` | one-step channel/model setup; preserve channel-owned endpoint/API/headers/auth and use unique models.dev metadata only |
 | `configure` with omitted fields | supplied endpoint/API/API-key values change; omitted values remain unchanged |
 | provider-wide `configure` | provider API changes and only Model Doctor-managed model APIs are synchronized; synchronized APIs stay managed and receive `explicitFields`, while user-owned model APIs remain unchanged and later `check`/`fix` preserves the explicit protocol |
-| unlisted third-party URL with ambiguous model metadata | `selection-required`; require `--metadata-provider`; the error message lists the tied metadata provider ids and `DoctorError.selectionCandidates` carries them structured so interactive flows can offer a picker instead of failing |
+| unlisted third-party URL with ambiguous model metadata | `selection-required`; require `--metadata-provider`; the error message lists the tied metadata provider ids and `DoctorError.selectionCandidates` carries them structured so interactive flows can offer a picker instead of failing; a tie inside one catalog provider is not resolved by `--metadata-provider` and asks for an exact model id instead |
 | third-party `--api` override | use explicit channel API; do not copy catalog provider API; use it for root-URL `/v1` normalization |
 | user-owned endpoint/header/capability differs | warning conflict; do not overwrite |
 | backup copy fails | `DoctorError("backup-error")`; no write |

@@ -1891,26 +1891,58 @@ function formatProviderCandidateList(providerIds: string[]): string {
 }
 
 /**
- * Builds the selection-required error for duplicate global model ids, listing
- * the tied models.dev providers so the user can pass --metadata-provider
- * (or pick one interactively) instead of guessing.
+ * Builds the selection-required error for ambiguous model metadata.
+ *
+ * Cross-provider ties list the tied models.dev providers so the user can pass
+ * --metadata-provider (or pick one interactively) instead of guessing.
+ * Provider-internal ties (multiple models of one provider) cannot be resolved
+ * by --metadata-provider, so they keep the exact-model-id guidance and carry
+ * no structured candidates.
  */
 function ambiguousModelSelectionError(target: string, modelId: string | undefined, match: ProviderMatch | undefined): DoctorError {
-  const ambiguousProviders = match?.ambiguousProviders ?? [];
-  const candidateModelId = match?.model?.id ?? modelId ?? "";
-  const selectionCandidates: SelectionCandidate[] = ambiguousProviders
-    .map((provider) => ({ providerId: provider.id, providerName: provider.name, modelId: candidateModelId }))
+  const ambiguousMatches = match?.ambiguousMatches ?? [];
+  const uniqueProviderIds = [...new Set(ambiguousMatches.map((entry) => entry.provider.id))];
+  if (uniqueProviderIds.length <= 1) {
+    return new DoctorError(
+      `Model selection for ${target}${modelId ? `/${modelId}` : ""} is ambiguous; choose an exact model id`,
+      "selection-required",
+    );
+  }
+  const selectionCandidates: SelectionCandidate[] = ambiguousMatches
+    .map((entry) => ({ providerId: entry.provider.id, providerName: entry.provider.name, modelId: entry.model?.id ?? modelId ?? "" }))
     .filter((candidate, index, all) => all.findIndex((other) => other.providerId === candidate.providerId) === index)
     .sort((left, right) => left.providerId.localeCompare(right.providerId));
-  const candidateText = selectionCandidates.length > 0
-    ? ` (metadata providers: ${formatProviderCandidateList(selectionCandidates.map((candidate) => candidate.providerId))})`
-    : "";
+  const candidateText = ` (metadata providers: ${formatProviderCandidateList(selectionCandidates.map((candidate) => candidate.providerId))})`;
   return new DoctorError(
     `Model metadata selection for ${target}${modelId ? `/${modelId}` : ""} is ambiguous; pass --metadata-provider <models.dev-provider>${candidateText}`,
     "selection-required",
     undefined,
     selectionCandidates,
   );
+}
+
+/**
+ * Filters tied matches down to an explicitly requested metadata provider.
+ * An empty result means the requested provider is not among the tied
+ * candidates; callers then keep the full tie authoritative.
+ */
+function filterMatchesByMetadataProvider(matches: ProviderMatch[], metadataProvider?: string): ProviderMatch[] {
+  if (!metadataProvider) return matches;
+  const target = metadataProvider.trim().toLowerCase();
+  if (!target) return matches;
+  return matches.filter((match) => [match.provider.id, match.provider.name]
+    .filter((value): value is string => typeof value === "string")
+    .some((value) => value.trim().toLowerCase() === target));
+}
+
+function ambiguousMatchResult(matches: ProviderMatch[]): ProviderMatch {
+  return {
+    provider: matches[0].provider,
+    score: matches[0].score,
+    matchedBy: [...new Set(matches.flatMap((match) => match.matchedBy)), "model-ambiguous"],
+    ambiguous: true,
+    ambiguousMatches: matches.map((match) => ({ provider: match.provider, model: match.model })),
+  };
 }
 
 function chooseMatch(catalog: ModelsDevCatalog, target: string, modelId?: string, metadataProvider?: string, allowGlobalMetadata = false): ProviderMatch | undefined {
@@ -1921,13 +1953,15 @@ function chooseMatch(catalog: ModelsDevCatalog, target: string, modelId?: string
     const bestScore = modelMatches[0]?.score ?? 0;
     const bestMatches = modelMatches.filter((match) => match.score === bestScore);
     if (bestMatches.length > 1) {
-      return {
-        provider: bestMatches[0].provider,
-        score: bestScore,
-        matchedBy: [...new Set(bestMatches.flatMap((match) => match.matchedBy)), "model-ambiguous"],
-        ambiguous: true,
-        ambiguousProviders: bestMatches.map((match) => match.provider),
-      };
+      // An explicit --metadata-provider resolves a cross-provider tie. A
+      // provider-internal tie (multiple models of one provider) keeps the
+      // candidates so the error can ask for an exact model id instead.
+      const providerFiltered = filterMatchesByMetadataProvider(bestMatches, metadataProvider);
+      const resolvedMatches = providerFiltered.length > 0 ? providerFiltered : bestMatches;
+      if (resolvedMatches.length === 1) {
+        return { ...resolvedMatches[0], matchedBy: [...resolvedMatches[0].matchedBy, "metadata-provider"] };
+      }
+      return ambiguousMatchResult(resolvedMatches);
     }
     return bestMatches[0] ?? providerMatch;
   }
@@ -1938,13 +1972,12 @@ function chooseMatch(catalog: ModelsDevCatalog, target: string, modelId?: string
   const bestScore = matches[0]?.score ?? 0;
   const bestMatches = matches.filter((match) => match.score === bestScore);
   if (bestMatches.length > 1) {
-    return {
-      provider: bestMatches[0].provider,
-      score: bestScore,
-      matchedBy: [...new Set(bestMatches.flatMap((match) => match.matchedBy)), "model-ambiguous"],
-      ambiguous: true,
-      ambiguousProviders: bestMatches.map((match) => match.provider),
-    };
+    const providerFiltered = filterMatchesByMetadataProvider(bestMatches, metadataProvider);
+    const resolvedMatches = providerFiltered.length > 0 ? providerFiltered : bestMatches;
+    if (resolvedMatches.length === 1) {
+      return { ...resolvedMatches[0], matchedBy: [...resolvedMatches[0].matchedBy, "metadata-provider"] };
+    }
+    return ambiguousMatchResult(resolvedMatches);
   }
   return bestMatches[0];
 }

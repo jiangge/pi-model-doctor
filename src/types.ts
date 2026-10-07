@@ -266,8 +266,11 @@ export interface ProviderMatch {
   ambiguous?: boolean;
   /** The provider is metadata-only; the configured channel owns transport fields. */
   metadataOnly?: boolean;
-  /** All tied best providers when `ambiguous` is true; used for disambiguation UIs. */
-  ambiguousProviders?: ModelsDevProvider[];
+  /**
+   * Tied best matches when `ambiguous` is true; each entry keeps its own model
+   * so disambiguation UIs can show the exact catalog model per provider.
+   */
+  ambiguousMatches?: { provider: ModelsDevProvider; model?: ModelsDevModel }[];
 }
 
 export interface ModelCandidate {

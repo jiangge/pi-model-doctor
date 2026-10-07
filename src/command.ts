@@ -1,5 +1,5 @@
 import { getAgentDir, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { ModelDoctor, type DoctorListItem } from "./doctor.ts";
+import { ModelDoctor, type AddProposal, type DoctorListItem } from "./doctor.ts";
 import { DoctorError, errorMessage, looksLikeCredentialValue, redactSensitiveText, type SelectionCandidate } from "./json.ts";
 import { PI_API_OPTIONS } from "./types.ts";
 import type { ChangePlan, CheckResult, ModelCandidate, PiApi, RefreshResult, RuntimeActivationStatus } from "./types.ts";
@@ -481,14 +481,16 @@ async function runSync(args: string[], flags: Record<string, string | boolean>, 
  * Runs proposeAdd and, when the model id is ambiguous across models.dev
  * providers in an interactive session, presents the tied metadata providers
  * through the paged picker. Picking one is equivalent to passing an explicit
- * --metadata-provider; cancelling is not-persisted with no proposal.
+ * --metadata-provider. Cancelling the picker returns undefined after a single
+ * `not-persisted` info notification; no error is raised and nothing is
+ * proposed or written.
  */
 async function proposeAddWithDisambiguation(
   ctx: ExtensionCommandContext,
   doctor: ModelDoctor,
   input: Parameters<ModelDoctor["proposeAdd"]>[0],
   pickMetadataProvider: (candidates: SelectionCandidate[]) => Promise<{ providerId: string } | undefined>,
-): Promise<ReturnType<ModelDoctor["proposeAdd"]>> {
+): Promise<AddProposal | undefined> {
   try {
     return await doctor.proposeAdd(input);
   } catch (error) {
@@ -498,7 +500,7 @@ async function proposeAddWithDisambiguation(
     const selection = await pickMetadataProvider(error.selectionCandidates);
     if (!selection) {
       ctx.ui.notify("Add cancelled. Status: not-persisted; models.json was not changed.", "info");
-      throw new DoctorError("Add cancelled. Status: not-persisted; models.json was not changed.", "authorization-required");
+      return undefined;
     }
     return doctor.proposeAdd({ ...input, metadataProvider: selection.providerId });
   }
@@ -555,8 +557,7 @@ async function runAdd(args: string[], flags: Record<string, string | boolean>, c
       candidates.map((candidate) => ({
         providerId: candidate.providerId,
         providerName: candidate.providerName,
-        id: candidate.modelId,
-        name: candidate.providerName,
+        id: candidate.modelId || candidate.providerId,
         deprecated: false,
         matchedBy: ["metadata-provider-candidate"],
         metadataOnly: true,
@@ -564,6 +565,7 @@ async function runAdd(args: string[], flags: Record<string, string | boolean>, c
     );
     return picked ? { providerId: picked.providerId } : undefined;
   });
+  if (!proposal) return;
   const preview = [
     `Proposed ${redactSensitiveText(proposal.target)}`,
     `Source: ${proposal.catalogSource}; matched by: ${proposal.matchedBy.join(", ") || "explicit fallback"}`,
