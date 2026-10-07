@@ -876,6 +876,41 @@ test("interactive sync paginates large candidate lists", async () => {
   assert.deepEqual((saved.data.providers?.openai?.models ?? []).map((model) => model.id), ["model-15"]);
 });
 
+test("sync picker lists paging actions before model toggles", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-sync-picker-order-"));
+  const targetPaths = paths(root);
+  const modelIds = Array.from({ length: 15 }, (_, index) => `model-${String(index + 1).padStart(2, "0")}`);
+  const models: Record<string, { id: string }> = Object.fromEntries(modelIds.map((id) => [id, { id }]));
+  const largeCatalog = normalizeCatalog({ openai: { id: "openai", api: "https://api.openai.com/v1", models } });
+  const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(largeCatalog) } });
+  const notifications: string[] = [];
+  const observedOrders: string[][] = [];
+  const ctx = {
+    hasUI: true,
+    ui: {
+      notify: (message: string) => notifications.push(message),
+      select: async (_prompt: string, choices: string[]) => {
+        observedOrders.push(choices);
+        return undefined;
+      },
+      confirm: async () => true,
+    },
+  } as never;
+  await runCommand("sync openai", ctx, doctor);
+  // The first round must keep Search…, Next page, and Done above the model
+  // toggles so they stay visible in terminals without list scrolling.
+  const first = observedOrders[0] ?? [];
+  const searchIndex = first.findIndex((choice) => choice.includes("Search"));
+  const nextIndex = first.findIndex((choice) => choice.includes("Next page"));
+  const doneIndex = first.findIndex((choice) => choice.includes("Done"));
+  const firstModelIndex = first.findIndex((choice) => choice.includes("model-01"));
+  assert.ok(searchIndex >= 0 && nextIndex >= 0 && doneIndex >= 0);
+  assert.ok(firstModelIndex > doneIndex, `model toggles must come after action controls; got ${JSON.stringify(first)}`);
+  assert.ok(nextIndex < firstModelIndex && doneIndex < firstModelIndex);
+  assert.match(notifications.at(-1) ?? "", /Sync cancelled.*not-persisted/s);
+  await assert.rejects(() => readFile(targetPaths.modelsPath));
+});
+
 test("adds a provider-only entry when a URL is given without a model id", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-provider-only-"));
   const targetPaths = paths(root);
@@ -1797,7 +1832,7 @@ test("interactive migration selects a destination when --to is omitted", async (
     hasUI: true,
     ui: {
       notify: (message: string) => notifications.push(message),
-      select: async (_prompt: string, choices: string[]) => choices[0],
+      select: async (_prompt: string, choices: string[]) => choices.find((choice) => /^\d+\. /.test(choice)) ?? choices.at(-1),
       confirm: async () => false,
     },
   } as never;
@@ -1816,13 +1851,78 @@ test("interactive add selects a candidate instead of silently taking the first m
     hasUI: true,
     ui: {
       notify: (message: string) => notifications.push(message),
-      select: async (_prompt: string, choices: string[]) => choices[0],
+      select: async (_prompt: string, choices: string[]) => choices.find((choice) => /^\d+\. /.test(choice)) ?? choices.at(-1),
       confirm: async () => true,
     },
   } as never;
   await runCommand("add openai", ctx, doctor);
   assert.equal((await readModelsJson(targetPaths.modelsPath)).data.providers?.openai?.models?.[0]?.id, "gpt-test");
   assert.equal(notifications.some((message) => /Applied/.test(message)), true);
+});
+
+test("interactive add picker paginates large candidate lists", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-add-picker-paginate-"));
+  const targetPaths = paths(root);
+  await writeFile(targetPaths.modelsPath, JSON.stringify({ providers: { openai: { baseUrl: "https://api.openai.com/v1", models: [] } } }));
+  const modelIds = Array.from({ length: 15 }, (_, index) => `model-${String(index + 1).padStart(2, "0")}`);
+  const models: Record<string, { id: string }> = Object.fromEntries(modelIds.map((id) => [id, { id }]));
+  const largeCatalog = normalizeCatalog({ openai: { id: "openai", api: "https://api.openai.com/v1", models } });
+  const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(largeCatalog) } });
+  const notifications: string[] = [];
+  const observedOrders: string[][] = [];
+  let selections = 0;
+  const ctx = {
+    hasUI: true,
+    ui: {
+      notify: (message: string) => notifications.push(message),
+      select: async (_prompt: string, choices: string[]) => {
+        observedOrders.push(choices);
+        selections += 1;
+        if (selections === 1) return choices.find((choice) => choice.includes("Next page")) ?? choices.at(-1);
+        return choices.find((choice) => choice.includes("model-15")) ?? choices.at(-1);
+      },
+      confirm: async () => true,
+    },
+  } as never;
+  await runCommand("add openai", ctx, doctor);
+  // The first round must show Search… and Next page before the model options.
+  const first = observedOrders[0] ?? [];
+  const nextIndex = first.findIndex((choice) => choice.includes("Next page"));
+  const firstModelIndex = first.findIndex((choice) => choice.includes("model-01"));
+  assert.ok(nextIndex >= 0 && firstModelIndex >= 0);
+  assert.ok(nextIndex < firstModelIndex, `Next page must precede model options; got ${JSON.stringify(first)}`);
+  assert.equal((await readModelsJson(targetPaths.modelsPath)).data.providers?.openai?.models?.[0]?.id, "model-15");
+  assert.equal(notifications.some((message) => /Applied/.test(message)), true);
+});
+
+test("interactive migrate picker searches and pages destination candidates", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-migrate-picker-page-"));
+  const targetPaths = paths(root);
+  await writeFile(targetPaths.modelsPath, JSON.stringify({ providers: { openai: { models: [{ id: "gpt-test" }] } } }));
+  const modelIds = Array.from({ length: 12 }, (_, index) => `target-${String(index + 1).padStart(2, "0")}`);
+  const models: Record<string, { id: string }> = Object.fromEntries(modelIds.map((id) => [id, { id }]));
+  const migrationCatalog = normalizeCatalog({ anthropic: { id: "anthropic", api: "https://api.anthropic.com", models } });
+  const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(migrationCatalog) } });
+  const notifications: string[] = [];
+  let selections = 0;
+  const ctx = {
+    hasUI: true,
+    ui: {
+      notify: (message: string) => notifications.push(message),
+      input: async () => "target-12",
+      select: async (_prompt: string, choices: string[]) => {
+        selections += 1;
+        if (selections === 1) return choices.find((choice) => choice.includes("Search")) ?? choices.at(-1);
+        return choices.find((choice) => choice.includes("target-12") && !choice.includes("Search")) ?? choices.at(-1);
+      },
+      confirm: async () => true,
+    },
+  } as never;
+  await runCommand("migrate openai/gpt-test --yes", ctx, doctor);
+  const saved = await readModelsJson(targetPaths.modelsPath);
+  const destination = saved.data.providers?.anthropic?.models?.find((model) => model.id === "target-12");
+  assert.ok(destination, "migration destination should be applied after search-filtered selection");
+  assert.equal(notifications.some((message) => /Migrated/.test(message)), true);
 });
 
 test("add command reports successful dry-runs and metadata-provider selection", async () => {

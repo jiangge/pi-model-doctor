@@ -275,6 +275,25 @@ async function selectModelsInteractively(
     const pageItems = filtered.slice(start, start + SYNC_PAGE_SIZE);
 
     const options: SyncPickOption[] = [];
+    // Action controls come first so they stay visible at the top of the
+    // dialog. Pi's extension selector renders every option as a plain text
+    // line without a scroll viewport, so paging actions listed after a full
+    // page of models can fall below the visible fold on ordinary terminals
+    // and the user can no longer flip pages.
+    const selectedInFilter = filtered.filter((candidate) => selected.has(syncCandidateIdentity(candidate))).length;
+    if (filtered.length > 0) {
+      options.push({ key: "action:select-all", label: `Select all (${filtered.length} matching)`, action: "select-all" });
+      options.push({ key: "action:invert", label: `Invert selection (${selectedInFilter}/${filtered.length} matching selected)`, action: "invert" });
+    }
+    if (selected.size > 0) {
+      options.push({ key: "action:clear", label: `Clear selection (${selected.size} total)`, action: "clear" });
+    }
+    options.push({ key: "action:search", label: search ? `Search… (current: "${search}")` : "Search…", action: "search" });
+    if (pageCount > 1) {
+      if (page < pageCount - 1) options.push({ key: "action:next", label: `Next page (${page + 1}/${pageCount})`, action: "next" });
+      if (page > 0) options.push({ key: "action:prev", label: `Previous page (${page + 1}/${pageCount})`, action: "prev" });
+    }
+    options.push({ key: "action:done", label: `Done (${selected.size} selected)`, action: "done" });
     for (const candidate of pageItems) {
       const identity = syncCandidateIdentity(candidate);
       const mark = selected.has(identity) ? "[x]" : "[ ]";
@@ -290,21 +309,6 @@ async function selectModelsInteractively(
         candidate,
       });
     }
-
-    const selectedInFilter = filtered.filter((candidate) => selected.has(syncCandidateIdentity(candidate))).length;
-    if (filtered.length > 0) {
-      options.push({ key: "action:select-all", label: `Select all (${filtered.length} matching)`, action: "select-all" });
-      options.push({ key: "action:invert", label: `Invert selection (${selectedInFilter}/${filtered.length} matching selected)`, action: "invert" });
-    }
-    if (selected.size > 0) {
-      options.push({ key: "action:clear", label: `Clear selection (${selected.size} total)`, action: "clear" });
-    }
-    options.push({ key: "action:search", label: search ? `Search… (current: "${search}")` : "Search…", action: "search" });
-    if (pageCount > 1) {
-      if (page < pageCount - 1) options.push({ key: "action:next", label: `Next page (${page + 1}/${pageCount})`, action: "next" });
-      if (page > 0) options.push({ key: "action:prev", label: `Previous page (${page + 1}/${pageCount})`, action: "prev" });
-    }
-    options.push({ key: "action:done", label: `Done (${selected.size} selected)`, action: "done" });
 
     const prompt = `${title} — ${selected.size} selected, ${filtered.length} matching`;
     const choices = options.map((option) => option.label);
@@ -349,6 +353,69 @@ async function selectModelsInteractively(
         break;
       case "done":
         return candidates.filter((candidate) => selected.has(syncCandidateIdentity(candidate)));
+    }
+  }
+}
+
+/**
+ * Paged, searchable, single-select model picker built on the same
+ * `select`/`input` dialogs. Choosing a model option resolves immediately
+ * with that candidate; Search… filters the candidate list; Next/Previous page
+ * move through large candidate lists; Esc cancels. Action options are listed
+ * before the model options so paging stays visible in terminals without list
+ * scrolling.
+ *
+ * Returns the selected candidate, or undefined when the user cancels.
+ */
+async function selectSingleModelInteractively(
+  ctx: ExtensionCommandContext,
+  title: string,
+  candidates: ModelCandidate[],
+): Promise<ModelCandidate | undefined> {
+  let search = "";
+  let page = 0;
+
+  while (true) {
+    const needle = search.trim().toLowerCase();
+    const filtered = needle
+      ? candidates.filter((candidate) => `${candidate.providerId} ${candidate.id} ${candidate.name ?? ""}`.toLowerCase().includes(needle))
+      : candidates.slice();
+    const pageCount = Math.max(1, Math.ceil(filtered.length / SYNC_PAGE_SIZE));
+    page = Math.min(Math.max(0, page), pageCount - 1);
+    const start = page * SYNC_PAGE_SIZE;
+    const pageItems = filtered.slice(start, start + SYNC_PAGE_SIZE);
+
+    const options: { label: string; candidate?: ModelCandidate; action?: "search" | "next" | "prev" }[] = [];
+    options.push({ label: search ? `Search… (current: "${search}")` : "Search…", action: "search" });
+    if (pageCount > 1) {
+      if (page < pageCount - 1) options.push({ label: `Next page (${page + 1}/${pageCount})`, action: "next" });
+      if (page > 0) options.push({ label: `Previous page (${page + 1}/${pageCount})`, action: "prev" });
+    }
+    pageItems.forEach((candidate, index) => {
+      options.push({ label: formatCandidateLabel(candidate, start + index), candidate });
+    });
+
+    const prompt = `${title} — ${filtered.length} matching`;
+    const choices = options.map((option) => option.label);
+    const choice = await ctx.ui.select(prompt, choices);
+    if (!choice) return undefined;
+    const chosenIndex = choices.indexOf(choice);
+    const chosen = chosenIndex >= 0 ? options[chosenIndex] : undefined;
+    if (!chosen) continue;
+    if (chosen.candidate) return chosen.candidate;
+    switch (chosen.action) {
+      case "search": {
+        const term = await ctx.ui.input("Search models (empty clears)", search ? `current: ${search}` : "model id or name substring");
+        search = term === undefined ? search : term.trim();
+        page = 0;
+        break;
+      }
+      case "next":
+        page += 1;
+        break;
+      case "prev":
+        page -= 1;
+        break;
     }
   }
 }
@@ -428,15 +495,11 @@ async function runAdd(args: string[], flags: Record<string, string | boolean>, c
   if (!modelId && !explicitEndpoint && ctx.hasUI) {
     const candidates = await doctor.listCandidates(providerId, false, undefined, selectedMetadataProvider);
     if (candidates.length === 0) throw new DoctorError(`No models.dev models found for ${providerId}; provide an explicit model id`, "invalid-target");
-    const choices = candidates.map((candidate, index) => formatCandidateLabel(candidate, index));
-    const selected = await ctx.ui.select(`Select model for ${redactSensitiveText(providerId)}`, choices);
-    if (!selected) {
+    const candidate = await selectSingleModelInteractively(ctx, `Select model for ${redactSensitiveText(providerId)}`, candidates);
+    if (!candidate) {
       ctx.ui.notify("Add cancelled. Status: not-persisted; models.json was not changed.", "info");
       return;
     }
-    const selectedIndex = choices.indexOf(selected);
-    const candidate = selectedIndex >= 0 ? candidates[selectedIndex] : undefined;
-    if (!candidate) throw new DoctorError("The selected model is no longer available; retry model discovery", "invalid-target");
     // Keep the configured provider id as the transport target. A candidate
     // provider may only supply metadata for an unlisted channel.
     resolvedTarget = providerId;
@@ -592,15 +655,12 @@ async function runMigrate(args: string[], flags: Record<string, string | boolean
   if (!destination && ctx.hasUI) {
     const candidates = await doctor.listMigrationCandidates(source, false);
     if (candidates.length === 0) throw new DoctorError(`No migration candidates found for ${source}; provide --to <provider/model>`, "invalid-target");
-    const choices = candidates.map((candidate, index) => formatCandidateLabel(candidate, index));
-    const selected = await ctx.ui.select(`Select migration destination for ${redactSensitiveText(source)}`, choices);
-    if (!selected) {
+    const candidate = await selectSingleModelInteractively(ctx, `Select migration destination for ${redactSensitiveText(source)}`, candidates);
+    if (!candidate) {
       ctx.ui.notify("Migration cancelled. Status: not-persisted; models.json was not changed.", "info");
       return;
     }
-    const selectedIndex = choices.indexOf(selected);
-    const candidate = selectedIndex >= 0 ? candidates[selectedIndex] : undefined;
-    destination = candidate ? `${candidate.providerId}/${candidate.id}` : undefined;
+    destination = `${candidate.providerId}/${candidate.id}`;
   }
   if (!destination) throw new DoctorError("Migration destination is required; destination selection is required in UI or --to <provider/model> in headless mode", "selection-required");
   validateProviderModelTarget(destination, "migrate destination");
