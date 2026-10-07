@@ -19,6 +19,7 @@ import {
   fileFingerprint,
   readModelsJson,
   writeModelsJson,
+  type SelectionCandidate,
 } from "./json.ts";
 import { ModelsDevClient, ModelsDevError } from "./models-dev.ts";
 import {
@@ -339,7 +340,7 @@ export class ModelDoctor {
     const configuredEntry = configuredByExplicitId ?? (requestedProviderId ? undefined : configuredByTarget);
     const match = catalog ? chooseMatch(catalog, target, requestedModelId, requestedMetadataProvider, Boolean(configuredEntry || looksLikeUrl(target))) : undefined;
     if (match?.ambiguous || match?.matchedBy.includes("model-ambiguous")) {
-      throw new DoctorError(`Model selection for ${target}${requestedModelId ? `/${requestedModelId}` : ""} is ambiguous; choose an exact model id`, "selection-required");
+      throw ambiguousModelSelectionError(target, requestedModelId, match);
     }
     if (!requestedModelId && !looksLikeUrl(target)) {
       throw new DoctorError(catalog
@@ -784,7 +785,12 @@ export class ModelDoctor {
     for (const modelId of modelIds) {
       const matchingCandidates = candidates.filter((candidate) => candidate.id.toLowerCase() === modelId.toLowerCase());
       if (matchingCandidates.length > 1 && !metadataProvider) {
-        throw new DoctorError(`Model ${modelId} is ambiguous for ${target}; pass --metadata-provider`, "selection-required");
+        throw new DoctorError(
+          `Model ${modelId} is ambiguous for ${target}; pass --metadata-provider <models.dev-provider> (candidates: ${formatProviderCandidateList(matchingCandidates.map((candidate) => candidate.providerId))})`,
+          "selection-required",
+          undefined,
+          matchingCandidates.map((candidate) => ({ providerId: candidate.providerId, providerName: candidate.providerName, modelId: candidate.id })),
+        );
       }
       if (matchingCandidates.length === 0 && catalog) {
         // Let proposeAdd produce the same explicit-fallback/error semantics as
@@ -1875,6 +1881,38 @@ function findingConfidence(code: FindingCode, userOwned: boolean): Finding["conf
   return "high";
 }
 
+/** Truncation bound for provider candidate lists embedded in error messages. */
+const PROVIDER_CANDIDATE_LIMIT = 8;
+
+function formatProviderCandidateList(providerIds: string[]): string {
+  const unique = [...new Set(providerIds)].sort((left, right) => left.localeCompare(right));
+  if (unique.length <= PROVIDER_CANDIDATE_LIMIT) return unique.join(", ");
+  return `${unique.slice(0, PROVIDER_CANDIDATE_LIMIT).join(", ")}, …and ${unique.length - PROVIDER_CANDIDATE_LIMIT} more`;
+}
+
+/**
+ * Builds the selection-required error for duplicate global model ids, listing
+ * the tied models.dev providers so the user can pass --metadata-provider
+ * (or pick one interactively) instead of guessing.
+ */
+function ambiguousModelSelectionError(target: string, modelId: string | undefined, match: ProviderMatch | undefined): DoctorError {
+  const ambiguousProviders = match?.ambiguousProviders ?? [];
+  const candidateModelId = match?.model?.id ?? modelId ?? "";
+  const selectionCandidates: SelectionCandidate[] = ambiguousProviders
+    .map((provider) => ({ providerId: provider.id, providerName: provider.name, modelId: candidateModelId }))
+    .filter((candidate, index, all) => all.findIndex((other) => other.providerId === candidate.providerId) === index)
+    .sort((left, right) => left.providerId.localeCompare(right.providerId));
+  const candidateText = selectionCandidates.length > 0
+    ? ` (metadata providers: ${formatProviderCandidateList(selectionCandidates.map((candidate) => candidate.providerId))})`
+    : "";
+  return new DoctorError(
+    `Model metadata selection for ${target}${modelId ? `/${modelId}` : ""} is ambiguous; pass --metadata-provider <models.dev-provider>${candidateText}`,
+    "selection-required",
+    undefined,
+    selectionCandidates,
+  );
+}
+
 function chooseMatch(catalog: ModelsDevCatalog, target: string, modelId?: string, metadataProvider?: string, allowGlobalMetadata = false): ProviderMatch | undefined {
   const providerMatches = ModelsDevClient.match(catalog, target, undefined, { allowPartialProvider: false });
   const providerMatch = providerMatches.find((match) => match.matchedBy.some((value) => value === "provider-id-or-name" || value === "api-url"));
@@ -1888,6 +1926,7 @@ function chooseMatch(catalog: ModelsDevCatalog, target: string, modelId?: string
         score: bestScore,
         matchedBy: [...new Set(bestMatches.flatMap((match) => match.matchedBy)), "model-ambiguous"],
         ambiguous: true,
+        ambiguousProviders: bestMatches.map((match) => match.provider),
       };
     }
     return bestMatches[0] ?? providerMatch;
@@ -1904,6 +1943,7 @@ function chooseMatch(catalog: ModelsDevCatalog, target: string, modelId?: string
       score: bestScore,
       matchedBy: [...new Set(bestMatches.flatMap((match) => match.matchedBy)), "model-ambiguous"],
       ambiguous: true,
+      ambiguousProviders: bestMatches.map((match) => match.provider),
     };
   }
   return bestMatches[0];

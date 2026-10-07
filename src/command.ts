@@ -1,6 +1,6 @@
 import { getAgentDir, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { ModelDoctor, type DoctorListItem } from "./doctor.ts";
-import { DoctorError, errorMessage, looksLikeCredentialValue, redactSensitiveText } from "./json.ts";
+import { DoctorError, errorMessage, looksLikeCredentialValue, redactSensitiveText, type SelectionCandidate } from "./json.ts";
 import { PI_API_OPTIONS } from "./types.ts";
 import type { ChangePlan, CheckResult, ModelCandidate, PiApi, RefreshResult, RuntimeActivationStatus } from "./types.ts";
 import { resolve } from "node:path";
@@ -477,6 +477,33 @@ async function runSync(args: string[], flags: Record<string, string | boolean>, 
   ctx.ui.notify(`${preview}\nStatus: ${statusMessage(status)}\nSynced. Backup: ${applied.backupPath ? redactSensitiveText(applied.backupPath) : "none (new file)"}`, status === "activation-failed" ? "warning" : "info");
 }
 
+/**
+ * Runs proposeAdd and, when the model id is ambiguous across models.dev
+ * providers in an interactive session, presents the tied metadata providers
+ * through the paged picker. Picking one is equivalent to passing an explicit
+ * --metadata-provider; cancelling is not-persisted with no proposal.
+ */
+async function proposeAddWithDisambiguation(
+  ctx: ExtensionCommandContext,
+  doctor: ModelDoctor,
+  input: Parameters<ModelDoctor["proposeAdd"]>[0],
+  pickMetadataProvider: (candidates: SelectionCandidate[]) => Promise<{ providerId: string } | undefined>,
+): Promise<ReturnType<ModelDoctor["proposeAdd"]>> {
+  try {
+    return await doctor.proposeAdd(input);
+  } catch (error) {
+    if (!(error instanceof DoctorError) || error.code !== "selection-required" || !ctx.hasUI || error.selectionCandidates.length === 0) {
+      throw error;
+    }
+    const selection = await pickMetadataProvider(error.selectionCandidates);
+    if (!selection) {
+      ctx.ui.notify("Add cancelled. Status: not-persisted; models.json was not changed.", "info");
+      throw new DoctorError("Add cancelled. Status: not-persisted; models.json was not changed.", "authorization-required");
+    }
+    return doctor.proposeAdd({ ...input, metadataProvider: selection.providerId });
+  }
+}
+
 async function runAdd(args: string[], flags: Record<string, string | boolean>, ctx: ExtensionCommandContext, doctor: ModelDoctor): Promise<void> {
   const providerId = args[0];
   if (!providerId || /^https?:\/\//i.test(providerId)) {
@@ -510,7 +537,7 @@ async function runAdd(args: string[], flags: Record<string, string | boolean>, c
   if (!modelId && !providerOnly) throw new DoctorError("Model selection is required; provide an explicit model id in non-interactive mode", "selection-required");
   ensureHeadlessAuthorization(ctx, flags, "add", dryRun);
   const apiKey = typeof flags["api-key"] === "string" ? flags["api-key"] : undefined;
-  const proposal = await doctor.proposeAdd({
+  const proposal = await proposeAddWithDisambiguation(ctx, doctor, {
     target: resolvedTarget,
     providerId: explicitProviderId,
     modelId,
@@ -521,6 +548,21 @@ async function runAdd(args: string[], flags: Record<string, string | boolean>, c
     allowLiteralApiKey: flags["allow-literal-api-key"] === true,
     dryRun,
     persistCache: !dryRun && !ctx.hasUI,
+  }, async (candidates) => {
+    const picked = await selectSingleModelInteractively(
+      ctx,
+      `Select metadata provider for ${redactSensitiveText(modelId ?? resolvedTarget)}`,
+      candidates.map((candidate) => ({
+        providerId: candidate.providerId,
+        providerName: candidate.providerName,
+        id: candidate.modelId,
+        name: candidate.providerName,
+        deprecated: false,
+        matchedBy: ["metadata-provider-candidate"],
+        metadataOnly: true,
+      })),
+    );
+    return picked ? { providerId: picked.providerId } : undefined;
   });
   const preview = [
     `Proposed ${redactSensitiveText(proposal.target)}`,

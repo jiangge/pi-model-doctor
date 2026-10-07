@@ -608,13 +608,80 @@ test("requires an explicit metadata provider when a third-party model id is ambi
     anthropic: { id: "anthropic", api: "https://api.anthropic.com", models: { shared: { id: "shared", limit: { context: 2000 } } } },
   });
   const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(ambiguousCatalog) } });
+  // The rejection must name the tied metadata providers and the
+  // --metadata-provider flag, and carry structured candidates for UI pickers.
+  let rejection: unknown;
   await assert.rejects(
     () => doctor.proposeAdd({ target: "https://third-party.example/v1", modelId: "shared", persistCache: false }),
-    (error: unknown) => error instanceof DoctorError && error.code === "selection-required",
+    (error: unknown) => {
+      rejection = error;
+      return error instanceof DoctorError && error.code === "selection-required";
+    },
+  );
+  const selectionError = rejection as DoctorError;
+  assert.match(selectionError.message, /--metadata-provider/);
+  assert.match(selectionError.message, /openai/);
+  assert.match(selectionError.message, /anthropic/);
+  assert.deepEqual(
+    selectionError.selectionCandidates.map((candidate) => candidate.providerId),
+    ["anthropic", "openai"],
   );
   const selected = await doctor.proposeAdd({ target: "https://third-party.example/v1", modelId: "shared", metadataProvider: "anthropic", persistCache: false });
   assert.equal(selected.metadataProviderId, "anthropic");
   assert.equal(selected.config.providers?.[selected.providerId]?.models?.[0]?.contextWindow, 2000);
+});
+
+test("interactive add resolves ambiguous metadata providers through a picker instead of failing", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-add-disambiguate-"));
+  const targetPaths = paths(root);
+  await writeFile(targetPaths.modelsPath, JSON.stringify({
+    providers: { channel: { baseUrl: "https://channel.example/v1", api: "openai-completions", models: [] } },
+  }, null, 2));
+  const ambiguousCatalog = normalizeCatalog({
+    zai: { id: "zai", api: "https://api.zai.example/v1", models: { "glm-shared": { id: "glm-shared", limit: { context: 128000 } } } },
+    aihubmix: { id: "aihubmix", api: "https://api.aihubmix.example/v1", models: { "glm-shared": { id: "glm-shared", limit: { context: 64000 } } } },
+  });
+  const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(ambiguousCatalog) } });
+  const notifications: string[] = [];
+  const ctx = {
+    hasUI: true,
+    ui: {
+      notify: (message: string) => notifications.push(message),
+      // The disambiguation picker lists metadata-provider candidates; pick the zai entry.
+      select: async (_prompt: string, choices: string[]) => choices.find((choice) => /\bzai\b/.test(choice)) ?? choices.at(-1),
+      confirm: async () => true,
+    },
+  } as never;
+  await runCommand("add channel glm-shared --yes", ctx, doctor);
+  const saved = await readModelsJson(targetPaths.modelsPath);
+  assert.equal(saved.data.providers?.channel?.models?.[0]?.id, "glm-shared");
+  assert.equal(saved.data.providers?.channel?.models?.[0]?.contextWindow, 128000);
+  assert.equal(notifications.some((message) => /Metadata provider: zai/.test(message)), true);
+});
+
+test("interactive add disambiguation cancellation is not-persisted", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-add-disambiguate-cancel-"));
+  const targetPaths = paths(root);
+  const before = JSON.stringify({ providers: { channel: { baseUrl: "https://channel.example/v1", api: "openai-completions", models: [] } } }, null, 2);
+  await writeFile(targetPaths.modelsPath, before);
+  const ambiguousCatalog = normalizeCatalog({
+    zai: { id: "zai", api: "https://api.zai.example/v1", models: { "glm-shared": { id: "glm-shared" } } },
+    aihubmix: { id: "aihubmix", api: "https://api.aihubmix.example/v1", models: { "glm-shared": { id: "glm-shared" } } },
+  });
+  const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(ambiguousCatalog) } });
+  const notifications: string[] = [];
+  const ctx = {
+    hasUI: true,
+    ui: {
+      notify: (message: string) => notifications.push(message),
+      select: async () => undefined,
+      confirm: async () => true,
+    },
+  } as never;
+  await runCommand("add channel glm-shared", ctx, doctor);
+  assert.match(notifications.at(-1) ?? "", /Add cancelled.*not-persisted/s);
+  assert.equal(await readFile(targetPaths.modelsPath, "utf8"), before);
+  assert.equal((await readdir(root)).some((file) => file.startsWith("models.json.bak-")), false);
 });
 
 test("preserves third-party headers and credentials while adding metadata-only models", async () => {

@@ -303,6 +303,7 @@ export class ModelsDevClient {
         matchedBy: [...new Set(bestMatches.flatMap((match) => match.matchedBy)), "model-ambiguous", "metadata-only"],
         ambiguous: true,
         metadataOnly: true,
+        ambiguousProviders: bestMatches.map((match) => match.provider),
       };
     }
     return { ...bestMatches[0], metadataOnly: true, matchedBy: [...bestMatches[0].matchedBy, "metadata-only"] };
@@ -327,6 +328,7 @@ export class ModelsDevClient {
         score: bestScore,
         matchedBy: [...new Set(bestMatches.flatMap((match) => match.matchedBy)), "model-ambiguous"],
         ambiguous: true,
+        ambiguousProviders: bestMatches.map((match) => match.provider),
       };
     }
     return endpointMatches[0] ?? direct;

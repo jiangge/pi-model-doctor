@@ -6,14 +6,26 @@ import { MODEL_DOCTOR_VERSION } from "./types.ts";
 import type { DoctorMetadata, JsonObject, PiModel, PiModelsJson, PiProvider } from "./types.ts";
 
 export class DoctorError extends Error {
+  /** Structured alternatives for selection-required errors so interactive UIs can present a picker. */
+  public readonly selectionCandidates: SelectionCandidate[];
   constructor(
     message: string,
     public readonly code: "invalid-config" | "io-error" | "backup-error" | "write-error" | "invalid-target" | "selection-required" | "authorization-required" | "concurrent-modification" = "io-error",
     public readonly cause?: unknown,
+    selectionCandidates: SelectionCandidate[] = [],
   ) {
     super(redactSensitiveText(message));
     this.name = "DoctorError";
+    this.selectionCandidates = selectionCandidates;
   }
+}
+
+export interface SelectionCandidate {
+  /** models.dev provider id that can be passed as --metadata-provider. */
+  providerId: string;
+  providerName?: string;
+  /** models.dev model id under that provider. */
+  modelId: string;
 }
 
 export function isRecord(value: unknown): value is JsonObject {

@@ -103,7 +103,7 @@ ModelDoctor.rollback(backupPath: string, options?: { dryRun?: boolean }): Promis
 | Rollback path is not a sibling timestamped backup or contains invalid JSON/schema | `DoctorError("invalid-target"/"backup-error")`; no current-file mutation |
 | Unlisted third-party URL with an exact unique model id | metadata-only proposal using models.dev model facts; preserve channel transport fields |
 | Unlisted third-party URL/channel with duplicate model id and one metadata-declared canonical provider | automatically use that provider as metadata-only; preserve channel endpoint/API/headers/authentication and report the selected metadata provider |
-| Unlisted third-party URL/channel with unresolved duplicate model id | `selection-required` until `--metadata-provider` selects the catalog provider |
+| Unlisted third-party URL/channel with unresolved duplicate model id | `selection-required` until `--metadata-provider` selects the catalog provider; the error lists the tied metadata provider ids (truncated to 8 + count) and carries structured `selectionCandidates` on `DoctorError` so the interactive add command can present the same paged, searchable picker; picker selection is equivalent to an explicit `--metadata-provider`, and picker cancellation is `not-persisted` with no proposal |
 | Third-party `--api` override | use the explicit Pi protocol for the channel; never infer or copy the catalog provider API; use it for root-URL `/v1` normalization |
 | Third-party check/fix | report `third-party-channel`; repair model metadata/capability fields only; pending provider-only channels may normalize only inferred root endpoint/API fields, never explicit endpoint/API/headers/authentication; later endpoint/API edits produce non-repairable conflicts |
 
