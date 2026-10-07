@@ -436,10 +436,13 @@ async function runSync(args: string[], flags: Record<string, string | boolean>, 
       ctx.ui.notify("Sync cancelled. Status: not-persisted; models.json was not changed.", "info");
       return;
     }
-    const metadataProviders = new Set(selected.filter((candidate) => candidate.metadataOnly).map((candidate) => candidate.providerId));
+    const metadataProviders = new Set(selected.map((candidate) => candidate.providerId));
     if (!metadataProvider && metadataProviders.size === 1) {
-      // The selected candidate carries the unambiguous models.dev provider
-      // identity needed by proposeSync for all subsequent model resolutions.
+      // The selection carries the unambiguous models.dev provider identity
+      // needed by proposeSync for all subsequent model resolutions. This also
+      // resolves shared-endpoint ties: selecting candidates from one catalog
+      // provider is an explicit provider choice, regardless of whether the
+      // candidates were matched by api-url or discovered as metadata-only.
       metadataProvider = [...metadataProviders][0];
     }
     modelIds = [...new Set(selected.map((candidate) => candidate.id))];
@@ -529,11 +532,12 @@ async function runAdd(args: string[], flags: Record<string, string | boolean>, c
       ctx.ui.notify("Add cancelled. Status: not-persisted; models.json was not changed.", "info");
       return;
     }
-    // Keep the configured provider id as the transport target. A candidate
-    // provider may only supply metadata for an unlisted channel.
+    // Keep the configured provider id as the transport target. The picked
+    // candidate is an explicit catalog-provider choice and is equivalent to
+    // an explicit --metadata-provider, including for shared-endpoint ties.
     resolvedTarget = providerId;
     modelId = candidate.id;
-    if (candidate.metadataOnly) selectedMetadataProvider = candidate.providerId;
+    selectedMetadataProvider = candidate.providerId;
   }
   const providerOnly = !modelId && explicitEndpoint !== undefined;
   if (!modelId && !providerOnly) throw new DoctorError("Model selection is required; provide an explicit model id in non-interactive mode", "selection-required");
@@ -557,7 +561,7 @@ async function runAdd(args: string[], flags: Record<string, string | boolean>, c
       candidates.map((candidate) => ({
         providerId: candidate.providerId,
         providerName: candidate.providerName,
-        id: candidate.modelId || candidate.providerId,
+        id: candidate.modelId,
         deprecated: false,
         matchedBy: ["metadata-provider-candidate"],
         metadataOnly: true,

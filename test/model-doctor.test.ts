@@ -964,6 +964,43 @@ test("sync dry-run and headless authorization are side-effect safe", async () =>
   assert.equal((await readdir(root)).some((file) => file.startsWith("models.json.bak-")), false);
 });
 
+test("interactive sync resolves a shared-endpoint tie from the picker selection", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-sync-shared-endpoint-"));
+  const targetPaths = paths(root);
+  const sharedCatalog = normalizeCatalog({
+    a: { id: "a", api: "https://shared.example/v1", models: { m: { id: "m", limit: { context: 111000 } } } },
+    b: { id: "b", api: "https://shared.example/v1", models: { m: { id: "m", limit: { context: 222000 } } } },
+  });
+  const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(sharedCatalog) } });
+  const notifications: { message: string; level: string }[] = [];
+  const picks = ["a/m", "Done"];
+  let selections = 0;
+  const ctx = {
+    hasUI: true,
+    ui: {
+      notify: (message: string, level: string) => notifications.push({ message, level }),
+      select: async (_prompt: string, choices: string[]) => {
+        const target = picks[Math.min(selections, picks.length - 1)];
+        selections += 1;
+        const picked = choices.find((choice) => choice.includes(target));
+        if (!picked) throw new Error(`expected "${target}" in picker, got: ${choices.join(" | ")}`);
+        return picked;
+      },
+      confirm: async () => true,
+    },
+  } as never;
+  await runCommand("sync https://shared.example/v1 --yes", ctx, doctor);
+  const saved = await readModelsJson(targetPaths.modelsPath);
+  // A channel endpoint that equals catalog providers' api URL is stored under
+  // the chosen catalog provider id, matching the single-provider URL design.
+  assert.equal(saved.data.providers?.a?.baseUrl, "https://shared.example/v1");
+  assert.equal(saved.data.providers?.a?.models?.[0]?.id, "m");
+  // Selecting the a/m candidate is an explicit provider choice: the proposal
+  // must use a's metadata instead of failing with a selection-required error.
+  assert.equal(saved.data.providers?.a?.models?.[0]?.contextWindow, 111000);
+  assert.equal(notifications.some((entry) => entry.level === "error"), false);
+});
+
 test("interactive sync selects several models and supports Done", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-sync-ui-"));
   const targetPaths = paths(root);
