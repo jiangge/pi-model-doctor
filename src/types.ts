@@ -478,6 +478,10 @@ export interface CommandResult {
 export type RuntimeActivationStatus = "persisted-and-active" | "persisted-reload-required" | "activation-failed" | "not-persisted";
 
 export interface AddInput {
+  /** Internal sync fallback: skip unavailable metadata. */
+  skipMetadata?: boolean;
+  /** Internal sync path: catalog facts must not own channel transport. */
+  channelTransport?: boolean;
   target: string;
   /** Explicit storage id for channel setup, as in `add providerA https://gateway.example/v1 [model]`. */
   providerId?: string;
@@ -497,9 +501,16 @@ export interface AddInput {
   persistCache?: boolean;
 }
 
+export interface SyncDiscoveryResult {
+  candidates: ModelCandidate[];
+  source: "channel" | "models.dev" | "local-explicit";
+  warnings: string[];
+}
+
 export interface SyncInput {
   target: string;
   modelIds: string[];
+  discovery?: SyncDiscoveryResult;
   /** Optional models.dev provider id used to scope third-party channel metadata. */
   metadataProvider?: string;
   /** Transport protocol for a third-party channel; inferred when omitted. */
@@ -581,6 +592,7 @@ export interface DoctorOptions {
   fetcher?: ModelsDevFetcherOptions;
   now?: () => Date;
   source?: string;
+  channelFetch?: typeof fetch;
 }
 
 export const MODEL_DOCTOR_METADATA_KEY = "_piModelDoctor";

@@ -1,3 +1,5 @@
+import { discoverChannel } from "./channel-discovery.ts";
+import type { SyncDiscoveryResult } from "./types.ts";
 import { CacheStore } from "./cache.ts";
 import {
   buildMetadata,
@@ -159,6 +161,12 @@ export interface DoctorListItem {
 }
 
 export class ModelDoctor {
+  private readonly syncDiscoveries = new WeakMap<SyncDiscoveryResult, string>();
+
+  private syncDiscoveryKey(input: SyncInput, data: unknown): string {
+    return JSON.stringify([input.target.trim(), data, input.api, input.apiKey, input.allowLiteralApiKey]);
+  }
+
   readonly cache: CacheStore;
   readonly modelsDev: ModelsDevClient;
   private readonly now: () => Date;
@@ -235,6 +243,47 @@ export class ModelDoctor {
     if (!endpoint) return direct.map((candidate) => ({ ...candidate, source: loaded.source }));
     return ModelsDevClient.listCandidates(loaded.catalog, endpoint, policy, modelId, metadataProvider)
       .map((candidate) => ({ ...candidate, metadataOnly: true, source: loaded.source }));
+  }
+
+  async discoverSync(input: SyncInput): Promise<SyncDiscoveryResult> {
+    validateAddTarget(input.target);
+    if (input.api !== undefined && !isPiApi(input.api)) throw new DoctorError("Unsupported API protocol", "invalid-target");
+    if (input.modelIds.some((id) => !id.trim() || /[\x00-\x1f\x7f]/.test(id) || isUnsafeIdentifier(id))) throw new DoctorError("Invalid model identifier", "invalid-target");
+    if (input.metadataProvider !== undefined && (!input.metadataProvider.trim() || isUnsafeIdentifier(input.metadataProvider))) throw new DoctorError("Invalid metadata provider", "invalid-target");
+    if (input.apiKey !== undefined && !input.apiKey.trim()) throw new DoctorError("API key reference must not be empty", "invalid-target");
+    const { data } = await readModelsJson(this.options.paths.modelsPath);
+    const bind = (result: SyncDiscoveryResult): SyncDiscoveryResult => {
+      this.syncDiscoveries.set(result, this.syncDiscoveryKey(input, data) + JSON.stringify(result));
+      return result;
+    };
+    const configured = findConfiguredProvider(getProviders(data), input.target);
+    const provider: PiProvider = configured ? cloneJson(configured.provider) : (looksLikeUrl(input.target) ? { baseUrl: input.target } : {});
+    if (provider.baseUrl && !input.api && !provider.api) {
+      provider.api = detectChannelApi(provider.baseUrl);
+      try {
+        const loaded = await this.modelsDev.load({ persist: false });
+        const match = chooseMatch(loaded.catalog, input.target);
+        if (match?.provider) provider.api = detectPiApi(match.provider);
+      } catch (error) { if (!(error instanceof ModelsDevError)) throw error; }
+    }
+    const cliKey = input.apiKey?.trim();
+    const allowedKey = cliKey && (isCredentialReference(cliKey) || input.allowLiteralApiKey) ? cliKey : provider.apiKey;
+    const discovered = await discoverChannel({ ...provider, api: input.api ?? provider.api, apiKey: allowedKey }, this.options.channelFetch);
+    if (cliKey && !isCredentialReference(cliKey) && !input.allowLiteralApiKey) discovered.warnings.push("Literal CLI API key omitted; use --allow-literal-api-key to opt in.");
+    const providerId = configured?.id ?? input.target;
+    if (discovered.ids !== undefined) return bind({
+      source: "channel", warnings: discovered.warnings,
+      candidates: discovered.ids.map((id) => ({ id, providerId, deprecated: false, matchedBy: ["channel-models-endpoint"] })),
+    });
+    try {
+      const candidates = await this.listCandidates(input.target, false, undefined, input.metadataProvider);
+      if (candidates.length) return bind({ source: "models.dev", candidates, warnings: discovered.warnings });
+    } catch (error) {
+      if (!(error instanceof ModelsDevError)) throw error;
+      discovered.warnings.push("models.dev metadata unavailable; using local/explicit IDs, not verified channel support.");
+    }
+    const ids = [...new Set([...getModels(provider).map((model) => model.id), ...input.modelIds])];
+    return bind({ source: "local-explicit", warnings: discovered.warnings, candidates: ids.map((id) => ({ id, providerId, deprecated: false, matchedBy: ["local-explicit-fallback"] })) });
   }
 
   async listMigrationCandidates(sourceTarget: string, persistCache = true): Promise<ModelCandidate[]> {
@@ -319,10 +368,12 @@ export class ModelDoctor {
     let catalogSource: AddProposal["catalogSource"] = "fallback";
     let warning: string | undefined;
     try {
-      const loaded = await this.modelsDev.load({ persist: input.persistCache !== false && !input.dryRun });
-      catalog = loaded.catalog;
-      catalogSource = loaded.source;
-      warning = loaded.warning;
+      if (!input.skipMetadata) {
+        const loaded = await this.modelsDev.load({ persist: input.persistCache !== false && !input.dryRun });
+        catalog = loaded.catalog;
+        catalogSource = loaded.source;
+        warning = loaded.warning;
+      }
     } catch (error) {
       if (!(error instanceof ModelsDevError)) throw error;
       if (error.code === "invalid-catalog") throw error;
@@ -438,7 +489,7 @@ export class ModelDoctor {
         .join(" ");
     }
     const policy = await this.getPolicyCatalog(input.persistCache !== false && !input.dryRun);
-    const metadataOnly = requestedProviderId !== undefined || match?.metadataOnly === true;
+    const metadataOnly = input.channelTransport === true || requestedProviderId !== undefined || match?.metadataOnly === true;
     const provisionalProviderOnly = isProvisionalProviderOnly(configuredEntry?.provider);
     const transportOwned = metadataOnly || looksLikeUrl(target) || provisionalProviderOnly;
     const providerId = requestedProviderId ?? providerIdForAddTarget(
@@ -752,7 +803,7 @@ export class ModelDoctor {
     const modelIds: string[] = [];
     for (const rawModelId of input.modelIds) {
       const modelId = rawModelId.trim();
-      if (modelId && !modelIds.some((existing) => existing.toLowerCase() === modelId.toLowerCase())) modelIds.push(modelId);
+      if (modelId && !modelIds.some((existing) => existing === modelId)) modelIds.push(modelId);
     }
     if (modelIds.length === 0) throw new DoctorError("Sync requires at least one model id", "selection-required");
     if (modelIds.some((modelId) => isUnsafeIdentifier(modelId))) throw new DoctorError("Model id must be a safe identifier", "invalid-target");
@@ -764,14 +815,20 @@ export class ModelDoctor {
 
     const loadedConfig = await readModelsJson(this.options.paths.modelsPath);
     let catalog: ModelsDevCatalog | undefined;
-    const warnings: string[] = [];
+    if (input.discovery && this.syncDiscoveries.get(input.discovery) !== this.syncDiscoveryKey(input, loadedConfig.data) + JSON.stringify(input.discovery)) {
+      throw new DoctorError("Sync discovery does not match this channel/configuration; discover again", "invalid-target");
+    }
+    const discovery = input.discovery ?? await this.discoverSync(input);
+    const warnings: string[] = [`Discovery source: ${discovery.source}`, ...discovery.warnings];
+    if (discovery.source === "channel") for (const id of modelIds) {
+      if (!discovery.candidates.some((candidate) => candidate.id === id)) throw new DoctorError(`Model ${redactSensitiveText(id)} is absent from the advertised channel list`, "invalid-target");
+    }
     try {
       const loaded = await this.modelsDev.load({ persist: input.persistCache !== false && !input.dryRun });
       catalog = loaded.catalog;
       if (loaded.warning) warnings.push(loaded.warning);
     } catch (error) {
       if (!(error instanceof ModelsDevError)) throw error;
-      if (error.code === "invalid-catalog") throw error;
       if (!looksLikeUrl(target) && !findConfiguredProvider(getProviders(loadedConfig.data), target)) throw error;
       warnings.push(`models.dev unavailable; each explicitly selected model will use conservative fallback metadata (${error.message})`);
     }
@@ -781,10 +838,12 @@ export class ModelDoctor {
     const plans: ChangePlan[] = [];
     const resolvedModelIds: string[] = [];
     let providerId: string | undefined;
+    const configuredTransport = findConfiguredProvider(getProviders(loadedConfig.data), target)?.provider;
+    const channelApi = input.api ?? (isPiApi(configuredTransport?.api) ? configuredTransport.api : detectChannelApi(configuredTransport?.baseUrl ?? target));
 
     for (const modelId of modelIds) {
-      const matchingCandidates = candidates.filter((candidate) => candidate.id.toLowerCase() === modelId.toLowerCase());
-      if (matchingCandidates.length > 1 && !metadataProvider) {
+      const matchingCandidates = candidates.filter((candidate) => candidate.id === modelId);
+      if (discovery.source !== "channel" && matchingCandidates.length > 1 && !metadataProvider) {
         throw new DoctorError(
           `Model ${modelId} is ambiguous for ${target}; pass --metadata-provider <models.dev-provider> (candidates: ${formatProviderCandidateList(matchingCandidates.map((candidate) => candidate.providerId))})`,
           "selection-required",
@@ -792,7 +851,7 @@ export class ModelDoctor {
           matchingCandidates.map((candidate) => ({ providerId: candidate.providerId, providerName: candidate.providerName, modelId: candidate.id })),
         );
       }
-      if (matchingCandidates.length === 0 && catalog) {
+      if (discovery.source !== "channel" && matchingCandidates.length === 0 && catalog) {
         // Let proposeAdd produce the same explicit-fallback/error semantics as
         // add, but do not silently fall back when a catalog match exists under
         // another provider and was not selected. An explicit URL may still
@@ -803,12 +862,18 @@ export class ModelDoctor {
           throw new DoctorError(`No models.dev model matched ${target}/${modelId}`, "invalid-target");
         }
       }
+      const exactMetadataProviders = catalog ? Object.values(catalog.providers).filter((provider) => (!metadataProvider || provider.id === metadataProvider) && Object.values(provider.models).some((model) => model.id === modelId)) : [];
+      const caseVariantMetadata = catalog && Object.values(catalog.providers).some((provider) => Object.values(provider.models).some((model) => model.id !== modelId && model.id.toLowerCase() === modelId.toLowerCase()));
+      const liveMetadataProvider = discovery.source === "channel" && exactMetadataProviders.length === 1 && !caseVariantMetadata ? exactMetadataProviders[0]?.id : undefined;
+      if (discovery.source === "channel" && exactMetadataProviders.length > 1) warnings.push(`Ambiguous metadata for ${redactSensitiveText(modelId)}; using conservative metadata without changing channel identity.`);
       const add = await this.proposeAdd({
         target,
         modelId,
+        channelTransport: discovery.source === "channel",
+        skipMetadata: !catalog || (discovery.source === "channel" ? !liveMetadataProvider : exactMetadataProviders.length === 0),
         requireConfiguredProvider: false,
-        metadataProvider,
-        api: input.api,
+        metadataProvider: discovery.source === "channel" ? liveMetadataProvider : metadataProvider,
+        api: discovery.source === "channel" ? channelApi : input.api,
         apiKey: input.apiKey,
         allowLiteralApiKey: input.allowLiteralApiKey,
         dryRun: true,
@@ -816,7 +881,7 @@ export class ModelDoctor {
       });
       providerId ??= add.providerId;
       if (providerId !== add.providerId) throw new DoctorError(`Sync target resolved to more than one provider id (${providerId}, ${add.providerId})`, "invalid-target");
-      if (!resolvedModelIds.some((existing) => existing.toLowerCase() === add.modelId.toLowerCase())) resolvedModelIds.push(add.modelId);
+      if (!resolvedModelIds.some((existing) => existing === add.modelId)) resolvedModelIds.push(add.modelId);
       const addProvider = getProviders(add.config)[add.providerId];
       const desiredModel = addProvider ? getModels(addProvider).find((model) => model.id === add.modelId) : undefined;
       if (!addProvider || !desiredModel) throw new DoctorError(`Unable to prepare ${target}/${modelId} for sync`, "invalid-config");

@@ -428,16 +428,20 @@ async function runSync(args: string[], flags: Record<string, string | boolean>, 
   const explicitModelIds = parseModelIdsFlag(flags.models);
   const selectedApi = typeof flags.api === "string" ? parsePiApiFlag(flags.api) : undefined;
   let modelIds = explicitModelIds;
+  if (!ctx.hasUI && modelIds.length === 0) throw new DoctorError("Model selection is required; use --models <id1,id2> in non-interactive mode", "selection-required");
+  ensureHeadlessAuthorization(ctx, flags, "sync", dryRun);
+  const discovery = await doctor.discoverSync({ target, modelIds, metadataProvider, api: selectedApi, apiKey: typeof flags["api-key"] === "string" ? flags["api-key"] : undefined, allowLiteralApiKey: flags["allow-literal-api-key"] === true, dryRun });
+  ctx.ui.notify(redactSensitiveText(`Sync discovery source: ${discovery.source}${discovery.warnings.length ? `\n${discovery.warnings.join("\n")}` : ""}`), "info");
   if (modelIds.length === 0 && ctx.hasUI) {
-    const candidates = await doctor.listCandidates(target, false, undefined, metadataProvider);
-    if (candidates.length === 0) throw new DoctorError(`No models.dev models found for ${target}; provide --models <id1,id2>`, "invalid-target");
+    const candidates = discovery.candidates;
+    if (candidates.length === 0) throw new DoctorError(`No ${discovery.source} models found for ${target}; provide --models <id1,id2>`, "invalid-target");
     const selected = await selectModelsInteractively(ctx, `Select models to sync for ${redactSensitiveText(target)}`, candidates);
     if (!selected || selected.length === 0) {
       ctx.ui.notify("Sync cancelled. Status: not-persisted; models.json was not changed.", "info");
       return;
     }
     const metadataProviders = new Set(selected.map((candidate) => candidate.providerId));
-    if (!metadataProvider && metadataProviders.size === 1) {
+    if (discovery.source === "models.dev" && !metadataProvider && metadataProviders.size === 1) {
       // The selection carries the unambiguous models.dev provider identity
       // needed by proposeSync for all subsequent model resolutions. This also
       // resolves shared-endpoint ties: selecting candidates from one catalog
@@ -451,6 +455,7 @@ async function runSync(args: string[], flags: Record<string, string | boolean>, 
   ensureHeadlessAuthorization(ctx, flags, "sync", dryRun);
   const apiKey = typeof flags["api-key"] === "string" ? flags["api-key"] : undefined;
   const proposal = await doctor.proposeSync({
+    discovery,
     target,
     modelIds,
     metadataProvider,
@@ -876,6 +881,7 @@ function helpText(): string {
     "/model-doctor fix [provider/model] [--dry-run] [--yes]",
     "/model-doctor remove <provider/model> [--dry-run] [--yes]",
     "/model-doctor refresh [--force] [--dry-run]",
+    `Sync discovers channel IDs first; fallback sources are unverified. Commands/auth-store references are not executed for discovery.`,
     `/model-doctor sync <provider-or-url> [--models <id1,id2>] [--metadata-provider <models.dev-provider>] [--api ${PI_API_FLAG_USAGE}] [--api-key <reference>] [--allow-literal-api-key] [--dry-run] [--yes]`,
     "/model-doctor migrate <provider/model> [--to <provider/model>] [--dry-run] [--yes] [--remove-source]",
     "/model-doctor cleanup-backups [--keep <count>] [--max-age-ms <milliseconds>] [--dry-run] [--yes]",
