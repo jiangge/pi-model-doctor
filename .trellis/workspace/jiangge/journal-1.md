@@ -134,3 +134,36 @@ Herdr同模型实现审查；未知null/unknown、fallback low、pricing provena
 ### Next Steps
 
 - None - task complete
+
+
+## Session 5: 未知缓存runtime配置省略
+
+**Date**: 2026-10-14
+**Task**: 未知缓存runtime配置省略
+**Branch**: `master`
+
+### Summary
+
+内部unknown/运行时省略；保留optimizer控制、managed安全迁移；112测试通过，真实optimizer导出synthetic验证成功。
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `77e6992` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
