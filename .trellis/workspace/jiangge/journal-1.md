@@ -70,3 +70,34 @@ Completed V3 audit remediation and main-session code review without subagents. A
 ### Next Steps
 
 - None - task complete
+
+
+## Session 3: add 显式 API key 保存并替换旧值
+
+**Date**: 2026-10-14
+**Task**: add 显式 API key 保存并替换旧值
+**Branch**: `master`
+
+### Summary
+
+Herdr相同模型开发/检查，主会话设计审查和109 tests/typecheck/diff check复验通过；仅add改变明文策略，引用原样保存并脱敏。
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+(No commits - planning session)
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
