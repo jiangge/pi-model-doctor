@@ -101,3 +101,36 @@ Herdr相同模型开发/检查，主会话设计审查和109 tests/typecheck/dif
 ### Next Steps
 
 - None - task complete
+
+
+## Session 4: 缓存能力未知证据修复
+
+**Date**: 2026-10-14
+**Task**: 缓存能力未知证据修复
+**Branch**: `master`
+
+### Summary
+
+Herdr同模型实现审查；未知null/unknown、fallback low、pricing provenance、ownership安全迁移；112 tests和typecheck/diff check通过。
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `33f05c5` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
