@@ -1392,8 +1392,7 @@ test("provider-only URL add accepts an API key reference and keeps official cata
   const proposal = await doctor.proposeAdd({ target: "https://gateway.example/v1", apiKey: "$GATEWAY_API_KEY", persistCache: false });
   assert.equal(proposal.config.providers?.gateway?.apiKey, "$GATEWAY_API_KEY");
   const literal = await doctor.proposeAdd({ target: "https://gateway.example/v1", apiKey: "literal-secret", persistCache: false });
-  assert.equal(literal.config.providers?.gateway?.apiKey, undefined);
-  assert.match(literal.warning ?? "", /not persisted/);
+  assert.equal(literal.config.providers?.gateway?.apiKey, "literal-secret");
 
   // An official models.dev endpoint URL keeps the catalog provider id.
   const official = await doctor.proposeAdd({ target: "https://api.openai.com/v1", persistCache: false });
@@ -2455,13 +2454,12 @@ test("secret redaction covers auth headers, OAuth, and nested headers", () => {
   assert.equal(redacted.includes("user:pass"), false);
 });
 
-test("literal API keys require explicit opt-in and safe references are retained", async () => {
+test("add explicitly authorizes literal API keys and retains safe references", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-api-key-policy-"));
   const targetPaths = paths(root);
   const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(catalog()) } });
   const omitted = await doctor.proposeAdd({ target: "https://api.openai.com/v1", providerId: "openai", modelId: "gpt-test", apiKey: "literal-secret", persistCache: false });
-  assert.equal(omitted.config.providers?.openai?.apiKey, undefined);
-  assert.match(omitted.warning ?? "", /not persisted/i);
+  assert.equal(omitted.config.providers?.openai?.apiKey, "literal-secret");
   const referenced = await doctor.proposeAdd({ target: "https://api.openai.com/v1", providerId: "openai", modelId: "gpt-test", apiKey: "$OPENAI_API_KEY", persistCache: false });
   assert.equal(referenced.config.providers?.openai?.apiKey, "$OPENAI_API_KEY");
   const allowed = await doctor.proposeAdd({ target: "https://api.openai.com/v1", providerId: "openai", modelId: "gpt-test", apiKey: "literal-secret", allowLiteralApiKey: true, persistCache: false });
@@ -2469,6 +2467,78 @@ test("literal API keys require explicit opt-in and safe references are retained"
   assert.match(allowed.warning ?? "", /literal API key/i);
   assert.equal(JSON.stringify(allowed.plan).includes("literal-secret"), false);
   assert.equal(JSON.stringify(omitted.plan).includes("literal-secret"), false);
+});
+
+test("explicit add credentials replace user-owned keys on both paths without leaking or writing dry-runs", async () => {
+  for (const modelId of [undefined, "gpt-test"]) {
+    const root = await mkdtemp(join(tmpdir(), "pi-add-auth-"));
+    const targetPaths = paths(root);
+    const initial = { providers: { channel: { baseUrl: "https://gateway.example/v1", api: "openai-completions", apiKey: "synthetic-old-key", headers: { custom: "keep" }, models: [] } } };
+    await writeFile(targetPaths.modelsPath, JSON.stringify(initial));
+    const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(catalog()) } });
+    const input = { target: "https://gateway.example/v1", providerId: "channel", modelId, persistCache: false };
+    for (const apiKey of ["synthetic-new-key", "$TEST_KEY", "${TEST_KEY}", "TEST_KEY", "!echo synthetic", "pi-auth:test"]) {
+      const proposal = await doctor.proposeAdd({ ...input, apiKey, dryRun: true });
+      assert.equal(proposal.config.providers?.channel?.apiKey, apiKey);
+      assert.deepEqual(proposal.config.providers?.channel?.headers, { custom: "keep" });
+      const preview = JSON.stringify(proposal.plan);
+      assert.equal(preview.includes("synthetic-old-key"), false);
+      assert.equal(preview.includes(apiKey), false);
+      assert.equal(JSON.stringify(proposal.config.providers?.channel?._piModelDoctor ?? {}).includes(apiKey), false);
+    }
+    const notifications: string[] = [];
+    const ctx = { hasUI: false, ui: { notify: (message: string) => notifications.push(message) } } as never;
+    const command = `add channel https://gateway.example/v1${modelId ? ` ${modelId}` : ""} --api-key synthetic-command-key`;
+    await runCommand(`${command} --dry-run`, ctx, doctor);
+    assert.deepEqual(JSON.parse(await readFile(targetPaths.modelsPath, "utf8")), initial);
+    assert.equal(notifications.join(" ").includes("synthetic-command-key"), false);
+    assert.equal(notifications.join(" ").includes("synthetic-old-key"), false);
+    assert.deepEqual(await readdir(root), ["models.json"]);
+    for (const apiKey of ["", "   "]) await assert.rejects(() => doctor.proposeAdd({ ...input, apiKey }), /must not be empty/);
+    const proposal = await doctor.proposeAdd({ ...input, apiKey: "synthetic-new-key" });
+    const result = await doctor.applyAdd(proposal);
+    assert.equal(JSON.parse(await readFile(targetPaths.modelsPath, "utf8")).providers.channel.apiKey, "synthetic-new-key");
+    assert.equal(JSON.parse(await readFile(result.backupPath!, "utf8")).providers.channel.apiKey, "synthetic-old-key");
+    const same = await doctor.proposeAdd({ ...input, apiKey: "synthetic-new-key" });
+    assert.equal(same.plan.changes.length, 0);
+    await doctor.applyAdd(same);
+    assert.equal((await readdir(root)).filter((name) => name.startsWith("models.json.bak-")).length, 1);
+    if (modelId) {
+      const omitted = await doctor.proposeAdd(input);
+      assert.equal(omitted.config.providers?.channel?.apiKey, "synthetic-new-key");
+      const sync = await doctor.proposeSync({ target: "channel", modelIds: [modelId], apiKey: "synthetic-sync-key", persistCache: false });
+      assert.equal(sync.config.providers?.channel?.apiKey, "synthetic-new-key");
+      assert.match(sync.warnings.join(" "), /not persisted/);
+      const configure = await doctor.proposeSetApi({ providerId: "channel", apiKey: "synthetic-config-key" });
+      assert.equal(configure.config.providers?.channel?.apiKey, "synthetic-new-key");
+    }
+    await runCommand(`${command} --yes`, ctx, doctor);
+    assert.equal(JSON.parse(await readFile(targetPaths.modelsPath, "utf8")).providers.channel.apiKey, "synthetic-command-key");
+    assert.equal(notifications.join(" ").includes("synthetic-command-key"), false);
+    assert.equal(notifications.join(" ").includes("synthetic-new-key"), false);
+  }
+});
+
+test("credential-only add by provider id preserves every existing transport and metadata field", async () => {
+  for (const suffix of ["", " gpt-test"]) {
+    const root = await mkdtemp(join(tmpdir(), "pi-add-key-only-"));
+    const targetPaths = paths(root);
+    const existing = { baseUrl: "https://gateway.example/custom", api: "anthropic-messages", apiKey: "old-private-secret", headers: { custom: "preserved" }, customTransport: { enabled: true }, models: [{ id: "keep", custom: true }], _piModelDoctor: { managed: false, version: 1 } };
+    await writeFile(targetPaths.modelsPath, JSON.stringify({ providers: { channel: existing } }));
+    const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(catalog()) } });
+    const messages: string[] = [];
+    const ctx = { hasUI: false, ui: { notify: (message: string) => messages.push(message) } } as never;
+    for (const key of ["new-private-secret", "$TEST_KEY", "${TEST_KEY}", "TEST_KEY", "!echo NEVER_EXECUTE"]) {
+      await runCommand(`add channel${suffix} --api-key '${key}' --yes`, ctx, doctor);
+      const saved = JSON.parse(await readFile(targetPaths.modelsPath, "utf8")).providers.channel;
+      assert.equal(saved.apiKey, key);
+      for (const field of ["baseUrl", "api", "headers", "customTransport"]) assert.deepEqual(saved[field], existing[field as keyof typeof existing]);
+      assert.deepEqual(saved.models[0], existing.models[0]);
+      if (!suffix) assert.deepEqual(saved._piModelDoctor, existing._piModelDoctor);
+      assert.equal(messages.join(" ").includes(key), false);
+      assert.equal(messages.join(" ").includes("old-private-secret"), false);
+    }
+  }
 });
 
 test("deprecated migration destination is advisory and cannot be applied", async () => {

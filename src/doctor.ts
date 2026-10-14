@@ -342,6 +342,9 @@ export class ModelDoctor {
 
   async proposeAdd(input: AddInput): Promise<AddProposal> {
     const target = input.target.trim();
+    const explicitAddAuth = input.credentialPolicy !== "sync";
+    const allowLiteralApiKey = explicitAddAuth || input.allowLiteralApiKey === true;
+    if (input.apiKey !== undefined && !input.apiKey.trim()) throw new DoctorError("API key reference must not be empty", "invalid-target");
     if (!target) throw new DoctorError("Add target is required", "invalid-target");
     if (target.includes("://") && !looksLikeUrl(target)) throw new DoctorError("Add provider URL must use http:// or https://", "invalid-target");
     if (!looksLikeUrl(target) && (isUnsafeIdentifier(target) || /[\\/]/.test(target))) throw new DoctorError("Add provider target must be a safe provider identifier", "invalid-target");
@@ -393,12 +396,13 @@ export class ModelDoctor {
     if (match?.ambiguous || match?.matchedBy.includes("model-ambiguous")) {
       throw ambiguousModelSelectionError(target, requestedModelId, match);
     }
-    if (!requestedModelId && !looksLikeUrl(target)) {
+    const credentialOnly = !requestedModelId && Boolean(configuredEntry) && input.apiKey !== undefined && explicitAddAuth;
+    if (!requestedModelId && !looksLikeUrl(target) && !credentialOnly) {
       throw new DoctorError(catalog
         ? `A model id is required for ${target}; select one from /model-doctor add candidates`
         : "A model id is required when models.dev metadata is unavailable", "selection-required");
     }
-    const providerOnly = !requestedModelId && looksLikeUrl(target);
+    const providerOnly = !requestedModelId && (looksLikeUrl(target) || credentialOnly);
     if (!requestedModelId && !providerOnly) {
       throw new DoctorError(catalog
         ? `A model id is required for ${target}; select one from /model-doctor add candidates`
@@ -425,16 +429,16 @@ export class ModelDoctor {
       // Provider-only add: create a provider entry with no model. A URL that
       // exactly matches a models.dev provider keeps the official provider id;
       // unlisted URLs get a channel-derived id.
-      if (configuredEntry) throw new DoctorError(`Provider ${requestedProviderId ?? target} is already configured; use sync to add models`, "invalid-target");
-      const endpoint = target;
+      if (configuredEntry && input.apiKey === undefined) throw new DoctorError(`Provider ${requestedProviderId ?? target} is already configured; use sync to add models`, "invalid-target");
+      const endpoint = configuredEntry?.provider.baseUrl ?? target;
       const channelApi = input.api ?? detectChannelApi(endpoint);
       const providerName = requestedProviderId ?? provider?.name ?? providerIdFromUrl(target);
       const requestedApiKey = input.apiKey?.trim();
       if (input.apiKey !== undefined && !requestedApiKey) throw new DoctorError("API key reference must not be empty", "invalid-target");
-      const apiKeyReference = requestedApiKey && (isCredentialReference(requestedApiKey) || input.allowLiteralApiKey === true)
+      const apiKeyReference = requestedApiKey && (isCredentialReference(requestedApiKey) || allowLiteralApiKey)
         ? requestedApiKey
         : undefined;
-      if (requestedApiKey && !isCredentialReference(requestedApiKey) && input.allowLiteralApiKey !== true) {
+      if (requestedApiKey && !isCredentialReference(requestedApiKey) && !allowLiteralApiKey) {
         warning = [warning, "Literal API key input was not persisted; use $ENV_VAR, ${ENV_VAR}, !command, or explicitly opt in with --allow-literal-api-key."]
           .filter((item): item is string => Boolean(item))
           .join(" ");
@@ -448,10 +452,11 @@ export class ModelDoctor {
       };
       const next = cloneJson(data);
       const catalogMatch = match?.provider !== undefined && requestedProviderId === undefined;
-      const pid = requestedProviderId
+      const pid = configuredEntry?.id ?? requestedProviderId
         ?? providerIdForAddTarget(target, undefined, configuredProviders, provider?.id ?? providerName, !catalogMatch, catalog ? Object.keys(catalog.providers) : []);
       const plan = mergeProvider(next, pid, configuredProvider, this.now(), {
         preserveProviderIdentity: true,
+        replaceApiKey: explicitAddAuth && input.apiKey !== undefined,
         endpointApiExplicit: input.api !== undefined,
       });
       let proposalConfig = next;
@@ -564,10 +569,10 @@ export class ModelDoctor {
     });
     const requestedApiKey = input.apiKey?.trim();
     if (input.apiKey !== undefined && !requestedApiKey) throw new DoctorError("API key reference must not be empty", "invalid-target");
-    const apiKeyReference = requestedApiKey && (isCredentialReference(requestedApiKey) || input.allowLiteralApiKey === true)
+    const apiKeyReference = requestedApiKey && (isCredentialReference(requestedApiKey) || allowLiteralApiKey)
       ? requestedApiKey
       : requestedApiKey ? undefined : transportOwned ? undefined : firstEnvironmentKey(provider);
-    if (requestedApiKey && !isCredentialReference(requestedApiKey) && input.allowLiteralApiKey !== true) {
+    if (requestedApiKey && !isCredentialReference(requestedApiKey) && !allowLiteralApiKey) {
       warning = [warning, "Literal API key input was not persisted; use $ENV_VAR, ${ENV_VAR}, !command, or explicitly opt in with --allow-literal-api-key."]
         .filter((item): item is string => Boolean(item))
         .join(" ");
@@ -586,6 +591,7 @@ export class ModelDoctor {
     const next = cloneJson(data);
     const plan = mergeProvider(next, providerId, configuredProvider, this.now(), {
       preserveProviderIdentity: transportOwned,
+      replaceApiKey: explicitAddAuth && input.apiKey !== undefined,
       normalizeEndpoint: normalizeConfiguredEndpoint,
       normalizeApi: provisionalProviderOnly && pendingApiAutoRepair && configuredChannelApi === undefined,
       endpointApiExplicit: input.api !== undefined || configuredEntry?.provider._piModelDoctor?.endpointApiExplicit === true,
@@ -875,6 +881,7 @@ export class ModelDoctor {
         metadataProvider: discovery.source === "channel" ? liveMetadataProvider : metadataProvider,
         api: discovery.source === "channel" ? channelApi : input.api,
         apiKey: input.apiKey,
+        credentialPolicy: "sync",
         allowLiteralApiKey: input.allowLiteralApiKey,
         dryRun: true,
         persistCache: false,
@@ -1278,7 +1285,7 @@ export class ModelDoctor {
   }
 }
 
-function mergeProvider(config: PiModelsJson, providerId: string, desired: PiProvider, now: Date, options: { preserveProviderIdentity?: boolean; normalizeEndpoint?: boolean; normalizeApi?: boolean; endpointApiExplicit?: boolean; endpointNormalizationBlocked?: boolean; endpointApiNormalizationBlocked?: boolean } = {}): ChangePlan {
+function mergeProvider(config: PiModelsJson, providerId: string, desired: PiProvider, now: Date, options: { replaceApiKey?: boolean; preserveProviderIdentity?: boolean; normalizeEndpoint?: boolean; normalizeApi?: boolean; endpointApiExplicit?: boolean; endpointNormalizationBlocked?: boolean; endpointApiNormalizationBlocked?: boolean } = {}): ChangePlan {
   if (isUnsafeIdentifier(providerId)) throw new DoctorError("Provider id uses an unsafe identifier", "invalid-target");
   const providers = getProviders(config);
   const existingEntry = findConfiguredProvider(providers, providerId);
@@ -1327,11 +1334,12 @@ function mergeProvider(config: PiModelsJson, providerId: string, desired: PiProv
       }
     }
   }
-  if (desired.apiKey !== undefined && provider.apiKey === undefined) {
+  if (desired.apiKey !== undefined && (provider.apiKey === undefined || options.replaceApiKey) && !jsonEqual(provider.apiKey, desired.apiKey)) {
+    changes.push({ path: `providers.${storageId}.apiKey`, before: provider.apiKey === undefined ? undefined : "[redacted]", after: "[redacted]", reason: "Configure provider authentication explicitly", ownership: "user" });
     provider.apiKey = desired.apiKey;
-    changes.push({ path: `providers.${storageId}.apiKey`, before: undefined, after: "[redacted]", reason: "Configure provider authentication reference", ownership: "user" });
   }
   const desiredModel = getModels(desired)[0];
+  if (!desiredModel) return sanitizePlan({ target: storageId, changes, conflicts, warnings: [] });
   const models = getModels(provider);
   const existingModel = models.find((model) => model.id === desiredModel.id);
   if (!existingModel) {

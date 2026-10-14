@@ -92,7 +92,9 @@ ModelDoctor.rollback(backupPath: string, options?: { dryRun?: boolean }): Promis
 | Provider env metadata contains lowercase, whitespace, punctuation, or is empty | typed `ModelsDevError("invalid-catalog")`; do not cache the response |
 | Two model ids differ only by case | preserve both exact entries; case-folded lookup returns ambiguous |
 | A normalized model map key differs from its model id by any character/case | invalidate the cache; do not silently rewrite identity |
-| Literal `--api-key` without `--allow-literal-api-key` | omit the literal from the proposal/config and emit a safe warning; references such as `$ENV_VAR`, `${ENV_VAR}`, `!command`, and `pi-auth:` are allowed |
+| Explicit non-empty `add --api-key` / `AddInput.apiKey` | authorize literals without a second flag; replace existing provider credentials on provider-only and model paths; store references unchanged without expansion/execution; omitted keys preserve existing values and identical keys are no-ops |
+| Literal `configure`/`sync --api-key` without `--allow-literal-api-key` | omit the literal from the proposal/config and emit a safe warning; references such as `$ENV_VAR`, `${ENV_VAR}`, `!command`, and `pi-auth:` are allowed. Internal sync reuse of proposeAdd must set `credentialPolicy: "sync"` to retain opt-in and ownership rules |
+| Credential change preview | redact both old and new values; exclude credentials from managed snapshots/caches. Config persists the selected key and the backup retains the previous config |
 | Proposal base file changed before apply | concurrent-modification error; no backup or write |
 | Refresh dry-run | catalog/config findings only; no cache persistence |
 | Non-interactive mutation without `--yes` | authorization error; no config/cache mutation |

@@ -489,13 +489,15 @@ export interface AddInput {
   modelId?: string;
   /** Optional models.dev provider id used only to disambiguate metadata. */
   metadataProvider?: string;
+  /** Internal sync reuse: retain opt-in literal policy and existing credential ownership. */
+  credentialPolicy?: "sync";
   /** Require a pre-existing provider when the command did not supply an endpoint. */
   requireConfiguredProvider?: boolean;
   /** Transport protocol for a third-party channel; inferred when omitted. */
   api?: PiApi;
-  /** An env/auth-store/command reference such as $OPENAI_API_KEY or !pi-auth. */
+  /** Explicit user-owned credential: a literal or unchanged env/auth-store/command reference. */
   apiKey?: string;
-  /** Explicit opt-in for persisting a literal API key; never enabled by default. */
+  /** Compatibility opt-in; add already authorizes literals, internal sync reuse still requires it. */
   allowLiteralApiKey?: boolean;
   dryRun?: boolean;
   persistCache?: boolean;

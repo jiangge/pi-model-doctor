@@ -529,7 +529,8 @@ async function runAdd(args: string[], flags: Record<string, string | boolean>, c
   if (!explicitEndpoint && !await doctor.isProviderConfigured(providerId)) {
     throw new DoctorError(`Provider ${providerId} is not configured in models.json; provide endpoint-url to create it`, "invalid-target");
   }
-  if (!modelId && !explicitEndpoint && ctx.hasUI) {
+  const credentialOnly = !modelId && typeof flags["api-key"] === "string";
+  if (!modelId && !explicitEndpoint && !credentialOnly && ctx.hasUI) {
     const candidates = await doctor.listCandidates(providerId, false, undefined, selectedMetadataProvider);
     if (candidates.length === 0) throw new DoctorError(`No models.dev models found for ${providerId}; provide an explicit model id`, "invalid-target");
     const candidate = await selectSingleModelInteractively(ctx, `Select model for ${redactSensitiveText(providerId)}`, candidates);
@@ -544,7 +545,7 @@ async function runAdd(args: string[], flags: Record<string, string | boolean>, c
     modelId = candidate.id;
     selectedMetadataProvider = candidate.providerId;
   }
-  const providerOnly = !modelId && explicitEndpoint !== undefined;
+  const providerOnly = !modelId && (explicitEndpoint !== undefined || credentialOnly);
   if (!modelId && !providerOnly) throw new DoctorError("Model selection is required; provide an explicit model id in non-interactive mode", "selection-required");
   ensureHeadlessAuthorization(ctx, flags, "add", dryRun);
   const apiKey = typeof flags["api-key"] === "string" ? flags["api-key"] : undefined;
@@ -887,6 +888,7 @@ function helpText(): string {
     "/model-doctor cleanup-backups [--keep <count>] [--max-age-ms <milliseconds>] [--dry-run] [--yes]",
     "/model-doctor rollback <models.json.bak-timestamp> [--dry-run] [--yes]",
     `Supported --api values: ${PI_API_FLAG_VALUES}`,
+    "add --api-key explicitly authorizes storing a literal and replaces existing credentials; omitted keys are preserved. Prefer environment/command references, stored unchanged. --allow-literal-api-key remains required for literals in configure/sync, not add.",
     "With add/configure, a URL in the second positional slot is treated as endpoint-url; otherwise it is treated as model. URL-first add syntax is not supported.",
     "Non-interactive writes require --yes; --dry-run never writes models.json, backups, or caches. Successful writes report persisted-and-active, persisted-reload-required, or activation-failed.",
   ].join("\n");
