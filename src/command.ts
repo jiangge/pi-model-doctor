@@ -580,7 +580,7 @@ async function runAdd(args: string[], flags: Record<string, string | boolean>, c
     `Proposed ${redactSensitiveText(proposal.target)}`,
     `Source: ${proposal.catalogSource}; matched by: ${proposal.matchedBy.join(", ") || "explicit fallback"}`,
     proposal.metadataProviderId ? `Metadata provider: ${redactSensitiveText(proposal.metadataProviderId)} (channel transport and credentials remain unchanged)` : undefined,
-    `Adapter: ${proposal.adapter}; confidence: ${proposal.confidence}; reasoning: ${proposal.reasoningControlType}; cache: prompt=${proposal.cacheCapabilities.prompt}, context=${proposal.cacheCapabilities.context}, kv=${proposal.cacheCapabilities.kv}`,
+    `Adapter: ${proposal.adapter}; confidence: ${proposal.confidence}; reasoning: ${proposal.reasoningControlType}; cache: prompt=${proposal.cacheCapabilities.prompt ?? "unknown"}, context=${proposal.cacheCapabilities.context ?? "unknown"}, kv=${proposal.cacheCapabilities.kv ?? "unknown"}`,
     `Required headers: ${proposal.requiredHeaders.length > 0 ? proposal.requiredHeaders.join(", ") : "none detected"} (values are never displayed)`,
     proposal.warning ? `Warning: ${redactSensitiveText(proposal.warning)}` : undefined,
     formatPlan(proposal.plan),

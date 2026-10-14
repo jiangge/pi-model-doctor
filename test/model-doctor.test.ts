@@ -16,7 +16,7 @@ import {
   resolveProviderAdapter,
   toPiModel,
 } from "../src/capabilities.ts";
-import { CacheStore } from "../src/cache.ts";
+import { CacheStore, isProviderCacheData } from "../src/cache.ts";
 import { ModelDoctor } from "../src/doctor.ts";
 import modelDoctorExtension, { getModelDoctorRefreshIntervalMs } from "../index.ts";
 import { discoverAndLoadExtensions } from "@earendil-works/pi-coding-agent";
@@ -312,13 +312,13 @@ test("normalizes effort, budget, toggle, and unknown reasoning plus cache signal
   assert.equal(normalizedReasoning.mappingConfidence, "high");
   assert.equal(normalizedReasoning.canDisable, true);
   const normalizedCache = resolveCache(current, model);
-  assert.equal(normalizedCache.prompt, false);
-  assert.equal(normalizedCache.context, false);
-  assert.equal(normalizedCache.kv, false);
+  assert.equal(normalizedCache.prompt, null);
+  assert.equal(normalizedCache.context, null);
+  assert.equal(normalizedCache.kv, null);
   assert.equal(normalizedCache.readPricing, true);
   assert.equal(normalizedCache.writePricing, true);
   assert.equal(normalizedCache.strategy, "model");
-  assert.deepEqual(normalizedCache.capability, { prompt: false, context: false, kv: false });
+  assert.deepEqual(normalizedCache.capability, { prompt: null, context: null, kv: null });
   assert.deepEqual(normalizedCache.pricing, { read: true, write: true });
   assert.equal(normalizedCache.source, "models.dev");
   assert.equal(normalizedCache.confidence, "medium");
@@ -366,6 +366,102 @@ test("normalizes effort, budget, toggle, and unknown reasoning plus cache signal
   assert.deepEqual(piModel.thinkingLevelMap, { minimal: null, low: "low", medium: "medium", high: "high" });
 });
 
+test("unknown channel sync and legacy fallback fix preserve ownership and dry-run files", async () => {
+  const root = await mkdtemp(join(tmpdir(), "doctor-unknown-cache-"));
+  const targetPaths = paths(root);
+  const initial = { providers: { windhub: { baseUrl: "https://windhub.example/v1", api: "openai-completions", models: [] } } };
+  await writeFile(targetPaths.modelsPath, JSON.stringify(initial));
+  const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(catalog()) } });
+  const sync = await doctor.proposeSync({ target: "windhub", modelIds: ["unknown-native-id"], dryRun: true });
+  const synced = sync.config.providers?.windhub?.models?.[0];
+  assert.ok(synced?.compat);
+  assert.equal(synced.compat.supportsKvCache, undefined);
+  assert.equal(synced.compat.cacheCapabilities?.kv, null);
+  assert.equal(synced.compat.cacheResolution?.confidence, "low");
+  assert.deepEqual(synced.compat.cacheResolution?.pricing, { read: false, write: false });
+  assert.equal(await readFile(targetPaths.modelsPath, "utf8"), JSON.stringify(initial));
+  assert.deepEqual(await readdir(root), ["models.json"]);
+
+  // Recreate the exact previous generated fallback fingerprint.
+  const legacy = synced;
+  assert.ok(legacy.compat);
+  legacy.compat.cacheCapabilities = { prompt: false, context: false, kv: false, readPricing: true, writePricing: true };
+  legacy.compat.cacheResolution = { ...legacy.compat.cacheResolution!, prompt: "unsupported", context: "unsupported", kv: "unsupported", pricing: { read: true, write: true }, confidence: "medium" };
+  legacy.compat.supportsPromptCaching = false;
+  legacy.compat.supportsContextCaching = false;
+  legacy.compat.supportsKvCache = false;
+  legacy._piModelDoctor!.managedValues!.compat = structuredClone(legacy.compat);
+  await writeFile(targetPaths.modelsPath, JSON.stringify(sync.config));
+  const before = await readFile(targetPaths.modelsPath, "utf8");
+  const migratedSync = await doctor.proposeSync({ target: "windhub", modelIds: ["unknown-native-id"], dryRun: true });
+  assert.equal(migratedSync.config.providers?.windhub?.models?.[0]?.compat?.supportsKvCache, undefined);
+  assert.equal(migratedSync.config.providers?.windhub?.models?.[0]?.compat?.cacheResolution?.kv, "unknown");
+  const fix = await doctor.proposeFix("windhub/unknown-native-id", { persistCache: false });
+  const corrected = fix.config.providers?.windhub?.models?.[0];
+  assert.equal(corrected?.compat?.supportsKvCache, undefined);
+  assert.equal(corrected?.compat?.cacheResolution?.kv, "unknown");
+  assert.equal(canManageField(corrected!, "compat"), true);
+  assert.equal(await readFile(targetPaths.modelsPath, "utf8"), before);
+  for (const ownership of ["no-snapshot", "unmanaged"] as const) {
+    const unsafe = structuredClone(sync.config);
+    const entry = unsafe.providers!.windhub!.models![0]!;
+    if (ownership === "no-snapshot") delete entry._piModelDoctor!.managedValues;
+    else entry._piModelDoctor = undefined;
+    await writeFile(targetPaths.modelsPath, JSON.stringify(unsafe));
+    const preserved = await doctor.proposeFix("windhub/unknown-native-id", { persistCache: false });
+    assert.deepEqual(preserved.config.providers?.windhub?.models?.[0]?.compat, entry.compat);
+    const preservedSync = await doctor.proposeSync({ target: "windhub", modelIds: ["unknown-native-id"], dryRun: true });
+    assert.deepEqual(preservedSync.config.providers?.windhub?.models?.[0]?.compat, entry.compat);
+  }
+  for (const manual of [false, true]) {
+    legacy.compat.supportsKvCache = manual;
+    legacy.compat.userMarker = "manual override";
+    await writeFile(targetPaths.modelsPath, JSON.stringify(sync.config));
+    const preserved = await doctor.proposeFix("windhub/unknown-native-id", { persistCache: false });
+    assert.equal(preserved.config.providers?.windhub?.models?.[0]?.compat?.supportsKvCache, manual);
+    const preservedSync = await doctor.proposeSync({ target: "windhub", modelIds: ["unknown-native-id"], dryRun: true });
+    assert.equal(preservedSync.config.providers?.windhub?.models?.[0]?.compat?.supportsKvCache, manual);
+  }
+});
+
+test("cache evidence distinguishes missing, denial, support, and real zero pricing", () => {
+  for (const value of [undefined, false, true]) {
+    const model = { id: "cache-test", ...(value === undefined ? {} : { interleaved: { kv_cache: value } }) };
+    const normalized = resolveCache(undefined, model);
+    const pi = toPiModel({ id: "custom", models: {} }, model);
+    assert.equal(normalized.kv, value ?? null);
+    assert.equal(pi.compat?.cacheResolution?.kv, value === undefined ? "unknown" : value ? "advisory" : "unsupported");
+    assert.equal(pi.compat?.supportsKvCache, value === false ? false : undefined);
+    assert.equal(pi.compat?.cacheCapabilities?.kv, value ?? null);
+  }
+  const priced = { id: "free-cache", cost: { cache_read: 0, cache_write: 0 } };
+  assert.deepEqual(resolveCache(undefined, priced).pricing, { read: true, write: true });
+  const fallback = resolveCache(undefined, priced, "fallback");
+  assert.deepEqual(fallback.pricing, { read: false, write: false });
+  assert.equal(fallback.confidence, "low");
+  assert.equal(isProviderCacheData({ schemaVersion: 2, providers: { custom: {
+    id: "custom", adapter: "fallback", capabilities: {
+      prompt: null, context: null, kv: null, reasoning: false,
+      reasoningControls: [], cacheSources: ["fallback"], cacheConfidences: ["low"],
+      cacheSignals: [{ modelId: "unknown", ...fallback }],
+    },
+  } } }), true);
+  assert.equal(resolveCache({ id: "provider", models: {}, interleaved: { kv_cache: true } }, { id: "denied", interleaved: { kv_cache: false } }).kv, false);
+});
+
+test("cache evidence rejects truthy denial labels and gives explicit denial precedence", () => {
+  for (const label of ["false", "unsupported", "disabled", "unavailable", "no"]) {
+    const model = { id: "denied", interleaved: { kv_cache: label, description: "kv_cache" } };
+    assert.equal(resolveCache(undefined, model).kv, false);
+    assert.equal(toPiModel({ id: "custom", models: {} }, model).compat?.supportsKvCache, false);
+  }
+  for (const label of ["true", "supported", "enabled"]) assert.equal(resolveCache(undefined, { id: "supported", interleaved: { kv_cache: label } }).kv, true);
+  assert.equal(resolveCache(undefined, { id: "unknown", interleaved: { kv_cache: "unrecognized" } }).kv, null);
+  assert.equal(resolveCache(undefined, { id: "nested", interleaved: { kv_cache: { supported: false, format: "kv_cache" }, description: "kv_cache" } }).kv, false);
+  assert.equal(resolveCache(undefined, { id: "array", interleaved: { details: [{ kv_cache: false }, "kv_cache"] } }).kv, false);
+  assert.equal(isProviderCacheData({ schemaVersion: 1, providers: {} }), false);
+});
+
 test("resolves provider adapters and independent cache capabilities", () => {
   const rich = richCatalog();
   const anthropicProvider = rich.providers.anthropic;
@@ -374,9 +470,9 @@ test("resolves provider adapters and independent cache capabilities", () => {
   assert.equal(cache.context, true);
   assert.equal(cache.kv, true);
   const compat = capabilityCompat("anthropic-messages", cache, resolveReasoning(anthropicProvider, anthropicModel), anthropicModel, "anthropic");
-  assert.equal(compat?.supportsPromptCaching, false);
-  assert.equal(compat?.supportsContextCaching, false);
-  assert.equal(compat?.supportsKvCache, false);
+  assert.equal(compat?.supportsPromptCaching, undefined);
+  assert.equal(compat?.supportsContextCaching, undefined);
+  assert.equal(compat?.supportsKvCache, undefined);
   assert.equal(compat?.cacheControlFormat, undefined);
   assert.equal(compat?.cacheResolution?.context, "advisory");
   assert.equal(compat?.cacheResolution?.kv, "advisory");
@@ -391,7 +487,7 @@ test("resolves provider adapters and independent cache capabilities", () => {
   assert.equal(resolveProviderAdapter({ id: "bedrock", models: {} }).id, "fallback");
   assert.equal(resolveProviderAdapter({ id: "pi-messages", models: {} }).id, "fallback");
   assert.equal(defaultPolicyCatalog().schemaVersion, 1);
-  assert.equal(compat?.cacheCapabilities?.prompt, false);
+  assert.equal(compat?.cacheCapabilities?.prompt, null);
   assert.equal(compat?.cacheCapabilities?.context, true);
   assert.equal(compat?.cacheCapabilities?.readPricing, false);
   assert.equal(compat?.cacheCapabilities?.kv, true);
@@ -2617,7 +2713,7 @@ test("provider cache is versioned, complete, and rejects secret-bearing summarie
   const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(catalog()) } });
   await doctor.modelsDev.load({ force: true });
   const providerCache = await doctor.cache.readProviderCache();
-  assert.equal(providerCache?.schemaVersion, 1);
+  assert.equal(providerCache?.schemaVersion, 2);
   assert.equal(providerCache?.providers.openai?.env?.[0], "OPENAI_API_KEY");
   assert.equal(providerCache?.providers.openai?.required_headers, undefined);
   await writeFile(targetPaths.providersCachePath, JSON.stringify({ version: 1, fetchedAt: new Date().toISOString(), data: { schemaVersion: 1, providers: { openai: { id: "openai", adapter: "openai-compatible", capabilities: {}, headers: { authorization: "SECRET" } } } } }));
@@ -2628,7 +2724,7 @@ test("provider cache is versioned, complete, and rejects secret-bearing summarie
   assert.deepEqual(await doctor.cache.readProviderCache(), undefined);
 
   const validCapabilities = { prompt: false, context: false, kv: false, reasoning: false, reasoningControls: [], cacheSources: [], cacheConfidences: [], cacheSignals: [] };
-  const cachePayload = (api: string) => ({ version: 1, fetchedAt: new Date().toISOString(), data: { schemaVersion: 1, providers: { local: { id: "local", api, adapter: "openai-compatible", capabilities: validCapabilities } } } });
+  const cachePayload = (api: string) => ({ version: 1, fetchedAt: new Date().toISOString(), data: { schemaVersion: 2, providers: { local: { id: "local", api, adapter: "openai-compatible", capabilities: validCapabilities } } } });
   await writeFile(targetPaths.providersCachePath, JSON.stringify(cachePayload("http://127.0.0.2:8080/v1")));
   assert.equal((await doctor.cache.readProviderCache())?.providers.local.api, "http://127.0.0.2:8080/v1");
   for (const api of ["http://10.0.0.1/v1", "http://public.example/v1", "ftp://public.example/v1", "javascript:alert(1)", " https://public.example/v1", "https://@public.example/v1", "https://user:pass@example.test/v1", "https://example.test/v1?api_key=secret"]) {

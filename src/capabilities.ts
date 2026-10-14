@@ -523,14 +523,14 @@ export function resolveCache(provider: ModelsDevProvider | undefined, model: Mod
   const modelKeys = model ? collectKeyNames(model).join(" ") : "";
   const keys = `${providerKeys} ${modelKeys}`;
   const cost = model?.cost;
-  const prompt = hasPositiveSignal(provider, model, /prompt.?cache|cache.?prompt|prompt_caching|cache_control|prefix.?cache/, /prompt.?cache|cache.?control|prefix.?cache/);
-  const context = hasPositiveSignal(provider, model, /context.?cache|context_cach|cached.?content/, /context.?cache|cached.?content/);
-  const kv = hasPositiveSignal(provider, model, /kv.?cache|key.?value.?cache|paged.?attention/, /kv.?cache|paged.?attention/);
-  const promptControl = prompt && /cache.?control|prompt.?cach(?:e|ing).?(?:field|control)|prompt_cache_control/.test(keys);
-  const contextControl = context && /cached.?content|context.?cache.?(?:field|control)/.test(keys);
-  const kvControl = kv && /kv.?cache.?(?:field|control)|key.?value.?cache.?(?:field|control)/.test(keys);
-  const readPricing = typeof cost?.cache_read === "number";
-  const writePricing = typeof cost?.cache_write === "number";
+  const prompt = cacheEvidence(provider, model, /prompt.?cache|cache.?prompt|prompt_caching|cache_control|prefix.?cache/, /prompt.?cache|cache.?control|prefix.?cache/);
+  const context = cacheEvidence(provider, model, /context.?cache|context_cach|cached.?content/, /context.?cache|cached.?content/);
+  const kv = cacheEvidence(provider, model, /kv.?cache|key.?value.?cache|paged.?attention/, /kv.?cache|paged.?attention/);
+  const promptControl = prompt === true && /cache.?control|prompt.?cach(?:e|ing).?(?:field|control)|prompt_cache_control/.test(keys);
+  const contextControl = context === true && /cached.?content|context.?cache.?(?:field|control)/.test(keys);
+  const kvControl = kv === true && /kv.?cache.?(?:field|control)|key.?value.?cache.?(?:field|control)/.test(keys);
+  const readPricing = sourceOverride !== "fallback" && typeof cost?.cache_read === "number";
+  const writePricing = sourceOverride !== "fallback" && typeof cost?.cache_write === "number";
   const usageRead = /input[_ -]?tokens|cache[_ -]?read[_ -]?tokens|read[_ -]?tokens/.test(keys)
     || hasTruthyKeySignal(model?.usage, /input|cache.?read|read.?tokens/)
     || hasTruthyKeySignal(provider?.usage, /input|cache.?read|read.?tokens/);
@@ -558,7 +558,7 @@ export function resolveCache(provider: ModelsDevProvider | undefined, model: Mod
     ?? (affinitySignal || affinityFormat !== undefined);
   const explicitSignals = /prompt.?cache|context.?cache|kv.?cache|cache_control|cached.?content|paged.?attention/.test(keys);
   const hasAnySignal = prompt || context || kv || readPricing || writePricing || retentionSupported || sessionAffinitySupported;
-  const confidence: NormalizedCache["confidence"] = explicitSignals ? "high" : hasAnySignal ? "medium" : "low";
+  const confidence: NormalizedCache["confidence"] = sourceOverride === "fallback" ? "low" : explicitSignals ? "high" : hasAnySignal ? "medium" : "low";
   const source: NormalizedCache["source"] = sourceOverride ?? (model ? "models.dev" : provider ? "provider" : "fallback");
   const strategy: NormalizedCache["strategy"] = model ? "model" : provider ? "provider" : "unknown";
   return {
@@ -763,7 +763,8 @@ export function capabilityCompat(
     },
   };
   const cacheWarnings: string[] = [];
-  compat.supportsPromptCaching = cache.prompt && cache.control.prompt && Boolean(adapterPolicy.cache.promptField) && !promptAdvisory;
+  if (cache.prompt === false) compat.supportsPromptCaching = false;
+  else if (cache.prompt === true && cache.control.prompt && adapterPolicy.cache.promptField && !promptAdvisory) compat.supportsPromptCaching = true;
   compat.cachePromptField = adapterPolicy.cache.promptField;
   if (api === "anthropic-messages" && cache.prompt && cache.control.prompt) {
     // cacheControlFormat is a formal Pi adapter field, but it must not be
@@ -784,10 +785,12 @@ export function capabilityCompat(
   if (cache.prompt && adapterPolicy.cache.explicitPromptField) {
     compat.supportsExplicitPromptCacheMode = true;
   }
-  compat.supportsContextCaching = cache.context && cache.control.context && Boolean(adapterPolicy.cache.contextField) && !contextAdvisory;
+  if (cache.context === false) compat.supportsContextCaching = false;
+  else if (cache.context === true && cache.control.context && adapterPolicy.cache.contextField && !contextAdvisory) compat.supportsContextCaching = true;
   compat.cacheContextField = adapterPolicy.cache.contextField;
   if (cache.context && !adapterPolicy.cache.contextField) cacheWarnings.push("Context cache is detected but has no provider-specific Pi field.");
-  compat.supportsKvCache = cache.kv && cache.control.kv && Boolean(adapterPolicy.cache.kvField) && !kvAdvisory;
+  if (cache.kv === false) compat.supportsKvCache = false;
+  else if (cache.kv === true && cache.control.kv && adapterPolicy.cache.kvField && !kvAdvisory) compat.supportsKvCache = true;
   compat.cacheKvField = adapterPolicy.cache.kvField;
   if (cache.kv && !adapterPolicy.cache.kvField) cacheWarnings.push("KV cache is detected but has no provider-specific Pi field.");
   if (adapterPolicy.cache.unsupported) {
@@ -934,8 +937,9 @@ export function toThinkingLevelMap(reasoning: NormalizedReasoning): Partial<Reco
   return map;
 }
 
-function cacheResolutionLevel(detected: boolean, hasControlField: boolean, advisory: boolean): CapabilityResolutionLevel {
-  if (!detected) return "unsupported";
+function cacheResolutionLevel(detected: boolean | null, hasControlField: boolean, advisory: boolean): CapabilityResolutionLevel {
+  if (detected === null) return "unknown";
+  if (detected === false) return "unsupported";
   if (advisory) return hasControlField ? "partial" : "advisory";
   return hasControlField ? "resolved" : "advisory";
 }
@@ -948,10 +952,32 @@ function isUnsupportedCacheSignal(policy: AdapterPolicy, signal: "prompt" | "con
       : /\bprompt\b/i.test(warning)) ?? false;
 }
 
-function hasPositiveSignal(left: unknown, right: unknown, keyPattern: RegExp, valuePattern: RegExp): boolean {
-  return hasTruthyKeySignal(left, keyPattern)
-    || hasTruthyKeySignal(right, keyPattern)
-    || [left, right].some((value) => collectStringValues(value).some((item) => valuePattern.test(item)));
+// Model evidence overrides provider defaults, including an explicit denial.
+function cacheEvidence(provider: unknown, model: unknown, keyPattern: RegExp, valuePattern: RegExp): boolean | null {
+  function evidence(value: unknown): boolean | null {
+    if (Array.isArray(value)) {
+      const signals = value.map(evidence);
+      return signals.includes(false) ? false : signals.includes(true) ? true : null;
+    }
+    if (!isRecord(value)) return typeof value === "string" && valuePattern.test(value) ? true : null;
+    const signals: Array<boolean | null> = [];
+    for (const [key, child] of Object.entries(value)) {
+      if (keyPattern.test(key)) {
+        if (typeof child === "boolean") signals.push(child);
+        else if (isRecord(child)) signals.push(firstBooleanMetadata(child, ["supported", "enabled", "available"]) ?? evidence(child));
+        else if (typeof child === "string") {
+          // Capability labels are not arbitrary truthy values. Denials must
+          // never become support merely because their text is non-empty.
+          const label = child.trim().toLowerCase();
+          if (["false", "unsupported", "disabled", "unavailable", "no"].includes(label)) signals.push(false);
+          else if (["true", "supported", "enabled", "available", "yes"].includes(label)) signals.push(true);
+        }
+      } else signals.push(evidence(child));
+    }
+    // An explicit denial is stronger than descriptive/format string hints.
+    return signals.includes(false) ? false : signals.includes(true) ? true : null;
+  }
+  return evidence(model) ?? evidence(provider);
 }
 
 function hasTruthyKeySignal(value: unknown, keyPattern: RegExp): boolean {

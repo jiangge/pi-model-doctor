@@ -142,9 +142,11 @@ export class ModelsDevClient {
         const capabilities = Object.values(provider.models).reduce((result, model) => {
           const cache = resolveCache(provider, model);
           const reasoning = resolveReasoning(provider, model);
-          result.prompt ||= cache.prompt;
-          result.context ||= cache.context;
-          result.kv ||= cache.kv;
+          for (const signal of ["prompt", "context", "kv"] as const) {
+            const next = cache[signal];
+            result[signal] = result[signal] === true || next === true ? true
+              : result[signal] === null || next === null ? null : false;
+          }
           result.reasoning ||= reasoning.supported;
           result.reasoningControls.add(reasoning.controlType);
           result.cacheSources.add(cache.source);
@@ -161,7 +163,7 @@ export class ModelsDevClient {
             source: cache.source,
           });
           return result;
-        }, { prompt: false, context: false, kv: false, reasoning: false, reasoningControls: new Set<string>(), cacheSources: new Set<string>(), cacheConfidences: new Set<string>(), cacheSignals: [] as Array<Record<string, unknown>> });
+        }, { prompt: Object.keys(provider.models).length ? false as boolean | null : resolveCache(provider, undefined).prompt, context: Object.keys(provider.models).length ? false as boolean | null : resolveCache(provider, undefined).context, kv: Object.keys(provider.models).length ? false as boolean | null : resolveCache(provider, undefined).kv, reasoning: false, reasoningControls: new Set<string>(), cacheSources: new Set<string>(), cacheConfidences: new Set<string>(), cacheSignals: [] as Array<Record<string, unknown>> });
         return [id, {
           id: provider.id,
           name: provider.name,
@@ -182,7 +184,7 @@ export class ModelsDevClient {
           },
         }];
       }));
-    await this.cache.writeProviderCache({ schemaVersion: 1, providers: providerSummaries }, headers);
+    await this.cache.writeProviderCache({ schemaVersion: 2, providers: providerSummaries }, headers);
   }
 
   static match(catalog: ModelsDevCatalog, target: string, modelId?: string, options: { allowPartialModel?: boolean; allowPartialProvider?: boolean } = {}): ProviderMatch[] {

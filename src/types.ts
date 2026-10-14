@@ -62,7 +62,8 @@ export interface PiCostTier {
   cacheWrite: number;
 }
 
-export type CapabilityResolutionLevel = "resolved" | "partial" | "advisory" | "unsupported";
+export type CacheEvidence = boolean | null;
+export type CapabilityResolutionLevel = "resolved" | "partial" | "advisory" | "unsupported" | "unknown";
 
 export interface PiCompat extends JsonObject {
   supportsDeveloperRole?: boolean;
@@ -98,9 +99,9 @@ export interface PiCompat extends JsonObject {
   cacheContextField?: string;
   cacheKvField?: string;
   cacheCapabilities?: {
-    prompt: boolean;
-    context: boolean;
-    kv: boolean;
+    prompt: CacheEvidence;
+    context: CacheEvidence;
+    kv: CacheEvidence;
     readPricing: boolean;
     writePricing: boolean;
   };
@@ -254,7 +255,7 @@ export interface ProviderCacheSummary {
 }
 
 export interface ProviderCacheData {
-  schemaVersion: 1;
+  schemaVersion: 2;
   providers: Record<string, ProviderCacheSummary>;
 }
 
@@ -314,12 +315,12 @@ export interface NormalizedReasoning {
 
 export interface NormalizedCache {
   /** Backward-compatible flat capability fields. */
-  prompt: boolean;
-  context: boolean;
-  kv: boolean;
+  prompt: CacheEvidence;
+  context: CacheEvidence;
+  kv: CacheEvidence;
   readPricing: boolean;
   writePricing: boolean;
-  capability: { prompt: boolean; context: boolean; kv: boolean };
+  capability: { prompt: CacheEvidence; context: CacheEvidence; kv: CacheEvidence };
   control: { prompt: boolean; context: boolean; kv: boolean };
   pricing: { read: boolean; write: boolean };
   usageReporting: { readTokens: boolean; writeTokens: boolean };

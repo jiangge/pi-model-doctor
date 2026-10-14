@@ -189,7 +189,7 @@ async function withCacheLock<T>(directory: string, operation: () => Promise<T>):
 }
 
 export function isProviderCacheData(value: unknown): value is ProviderCacheData {
-  if (!isRecord(value) || value.schemaVersion !== 1 || !isRecord(value.providers) || hasSensitiveCacheKey(value)) return false;
+  if (!isRecord(value) || value.schemaVersion !== 2 || !isRecord(value.providers) || hasSensitiveCacheKey(value)) return false;
   return Object.entries(value.providers).every(([providerKey, summary]) => {
     if (isUnsafeCacheKey(providerKey) || !isRecord(summary) || typeof summary.id !== "string" || summary.id.trim() === "" || isUnsafeCacheKey(summary.id)
       || normalizeCacheIdentifier(providerKey) !== normalizeCacheIdentifier(summary.id)
@@ -206,7 +206,7 @@ export function isProviderCacheData(value: unknown): value is ProviderCacheData 
 
 function isProviderCapabilitySummary(value: JsonObject): boolean {
   for (const key of ["prompt", "context", "kv", "reasoning"] as const) {
-    if (typeof value[key] !== "boolean") return false;
+    if (typeof value[key] !== "boolean" && !(key !== "reasoning" && value[key] === null)) return false;
   }
   const reasoningControls = value.reasoningControls;
   const cacheSources = value.cacheSources;
@@ -225,7 +225,8 @@ function isProviderCacheSignal(value: unknown): boolean {
   for (const key of ["capability", "control", "pricing", "usageReporting", "retention", "sessionAffinity"] as const) {
     if (!isRecord(value[key])) return false;
   }
-  if (hasInvalidBooleanFields(value.capability, ["prompt", "context", "kv"])) return false;
+  const capability = value.capability;
+  if (!isRecord(capability) || ["prompt", "context", "kv"].some((key) => typeof capability[key] !== "boolean" && capability[key] !== null)) return false;
   if (hasInvalidBooleanFields(value.control, ["prompt", "context", "kv"])) return false;
   if (hasInvalidBooleanFields(value.pricing, ["read", "write"])) return false;
   if (hasInvalidBooleanFields(value.usageReporting, ["readTokens", "writeTokens"])) return false;
