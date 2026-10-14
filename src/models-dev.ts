@@ -653,7 +653,15 @@ function resolveCandidateCacheResolution(
   cache: ReturnType<typeof resolveCache>,
   policy: PolicyCatalog,
 ): NonNullable<import("./types.ts").PiCompat["cacheResolution"]> | undefined {
-  return capabilityCompat(detectPiApi(provider), cache, resolveReasoning(provider, model), model, provider.id, policy)?.cacheResolution;
+  const runtime = capabilityCompat(detectPiApi(provider), cache, resolveReasoning(provider, model), model, provider.id, policy)?.cacheResolution;
+  return {
+    ...runtime,
+    prompt: cache.prompt === null ? "unknown" : cache.prompt === false ? "unsupported" : runtime?.prompt ?? "advisory",
+    context: cache.context === null ? "unknown" : cache.context === false ? "unsupported" : runtime?.context ?? "advisory",
+    kv: cache.kv === null ? "unknown" : cache.kv === false ? "unsupported" : runtime?.kv ?? "advisory",
+    control: cache.control, pricing: cache.pricing, usageReporting: cache.usageReporting,
+    retention: cache.retention, sessionAffinity: cache.sessionAffinity, confidence: cache.confidence, source: cache.source,
+  };
 }
 
 export function matchConfidence(match: ProviderMatch): "high" | "medium" | "low" {

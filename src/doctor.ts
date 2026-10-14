@@ -33,6 +33,7 @@ import {
   endpointApiForModel,
   inferProviderEndpoint,
   normalizeEndpointForApi,
+  omitUnknownCacheCompat,
   isPolicyCatalog,
   resolveCache,
   resolveProviderAdapter,
@@ -1450,7 +1451,7 @@ function mergeModel(providerId: string, existing: PiModel, desired: PiModel, cha
   const reclaimedExplicitFields = new Set<string>();
   for (const field of ["name", "api", "reasoning", "thinkingLevelMap", "input", "cost", "contextWindow", "maxTokens", "compat"] as const) {
     if (options.preserveTransport && field === "api") continue;
-    const value = desired[field];
+    const value = field === "compat" && desired.compat ? preserveCacheExtensionCompat(existing.compat, desired.compat) : desired[field];
     // Compat can contain manual runtime controls. Legacy managed metadata
     // without a snapshot is not sufficient evidence to replace those controls.
     if (field === "compat" && existing.compat !== undefined && !hasCompatOwnershipSnapshot(existing)) {
@@ -1559,16 +1560,40 @@ function hasCompatOwnershipSnapshot(model: PiModel): boolean {
   return hasDoctorMetadata(model) && isRecord(model._piModelDoctor.managedValues) && "compat" in model._piModelDoctor.managedValues;
 }
 
+const DOCTOR_COMPAT_FIELDS = new Set([
+  "capabilityAdapter", "capabilityPolicyVersion", "cacheCapabilities", "cacheResolution", "cacheWarnings",
+  "cachePromptField", "cacheContextField", "cacheKvField", "supportsPromptCaching", "supportsContextCaching", "supportsKvCache",
+  "reasoningControlType", "canDisable", "maxOutputTokens", "mappingConfidence", "fallbackReason", "maxBudgetTokens", "reasoningPolicy",
+  "supportsReasoningEffort", "reasoningEffortField", "thinkingFormat", "thinkingConfig", "reasoningAdaptiveField", "forceAdaptiveThinking",
+  "supportsReasoningBudget", "reasoningBudgetField", "minBudgetTokens", "reasoningBudgetMinTokens", "reasoningBudgetTokens",
+  "reasoningToggleField", "reasoningToggleOnValue", "reasoningToggleOffValue", "reasoningFallback", "reasoningWarnings", "supportsTemperature",
+]);
+
+function preserveCacheExtensionCompat(existing: PiModel["compat"], desired: NonNullable<PiModel["compat"]>): NonNullable<PiModel["compat"]> {
+  const next = cloneJson(desired);
+  for (const key of ["sendSessionAffinityHeaders", "sessionAffinityFormat", "supportsLongCacheRetention", "supportsExplicitPromptCacheMode", "cacheControlFormat"] as const) {
+    if (!(key in next) && existing?.[key] !== undefined) (next as JsonObject)[key] = cloneJson(existing[key]);
+  }
+  // Unknown extension keys are outside Doctor's generated capability namespace.
+  for (const [key, value] of Object.entries(existing ?? {})) {
+    if (!(key in next) && !DOCTOR_COMPAT_FIELDS.has(key)) next[key] = cloneJson(value);
+  }
+  return next;
+}
+
 function canCorrectLegacyFallbackCache(model: PiModel): boolean {
   const compat = model.compat;
-  return compat?.cacheResolution?.source === "fallback"
+  const currentUnknown = compat?.cacheCapabilities && Object.values(compat.cacheCapabilities).includes(null)
+    || compat?.cacheResolution && [compat.cacheResolution.prompt, compat.cacheResolution.context, compat.cacheResolution.kv].includes("unknown");
+  const legacy = compat?.cacheResolution?.source === "fallback"
     && compat.cacheCapabilities?.prompt === false
     && compat.cacheCapabilities.context === false && compat.cacheCapabilities.kv === false
     && compat.cacheCapabilities.readPricing === true && compat.cacheCapabilities.writePricing === true
-    && compat.cacheResolution.confidence === "medium"
+    && compat.cacheResolution.confidence === "medium";
+  return Boolean((legacy || currentUnknown)
     && hasDoctorMetadata(model) && isRecord(model._piModelDoctor.managedValues)
     && jsonEqual(model._piModelDoctor.managedValues.compat, compat)
-    && canManageField(model, "compat") && !isExplicitField(model, "compat");
+    && canManageField(model, "compat") && !isExplicitField(model, "compat"));
 }
 
 function applyRepairPlan(config: PiModelsJson, target: string, catalog: ModelsDevCatalog, findings: Finding[], now: Date, source: string, policy: PolicyCatalog): ChangePlan {
@@ -1589,14 +1614,28 @@ function applyRepairPlan(config: PiModelsJson, target: string, catalog: ModelsDe
       const before = cloneJson(model.compat);
       const cache = resolveCache(undefined, undefined, "fallback");
       const next = cloneJson(before);
-      next.cacheCapabilities = { ...cache.capability, readPricing: false, writePricing: false };
-      next.cacheResolution = {
-        prompt: "unknown", context: "unknown", kv: "unknown", control: cache.control,
-        pricing: cache.pricing, usageReporting: cache.usageReporting, retention: cache.retention,
-        sessionAffinity: cache.sessionAffinity, confidence: "low", source: "fallback",
-      };
-      for (const field of ["supportsPromptCaching", "supportsContextCaching", "supportsKvCache"] as const) {
-        if (next[field] === false) delete next[field];
+      const legacy = before.cacheResolution?.confidence === "medium" && before.cacheResolution.source === "fallback";
+      if (!legacy) {
+        for (const signal of ["prompt", "context", "kv"] as const) {
+          cache[signal] = before.cacheCapabilities?.[signal] ?? null;
+          cache.capability[signal] = cache[signal];
+          cache.control[signal] = before.cacheResolution?.control?.[signal] === true;
+        }
+        cache.readPricing = before.cacheCapabilities?.readPricing === true;
+        cache.writePricing = before.cacheCapabilities?.writePricing === true;
+        cache.pricing = { read: cache.readPricing, write: cache.writePricing };
+        cache.confidence = before.cacheResolution?.confidence ?? "low";
+        cache.source = before.cacheResolution?.source ?? "fallback";
+        cache.retention = before.cacheResolution?.retention ?? cache.retention;
+        cache.sessionAffinity = before.cacheResolution?.sessionAffinity ?? cache.sessionAffinity;
+        cache.usageReporting = {
+          readTokens: before.cacheResolution?.usageReporting?.readTokens === true,
+          writeTokens: before.cacheResolution?.usageReporting?.writeTokens === true,
+        };
+      }
+      omitUnknownCacheCompat(next, cache);
+      for (const [signal, field] of [["prompt", "supportsPromptCaching"], ["context", "supportsContextCaching"], ["kv", "supportsKvCache"]] as const) {
+        if (next[field] === false && cache[signal] === null) delete next[field];
       }
       if (!jsonEqual(before, next)) {
         model.compat = next;
@@ -1663,7 +1702,7 @@ function applyRepairPlan(config: PiModelsJson, target: string, catalog: ModelsDe
     }
   }
   for (const field of ["name", "api", "reasoning", "thinkingLevelMap", "input", "cost", "contextWindow", "maxTokens", "compat"] as const) {
-    const value = desired[field];
+    const value = field === "compat" && desired.compat ? preserveCacheExtensionCompat(model.compat, desired.compat) : desired[field];
     if (field === "compat" && model.compat !== undefined && !hasCompatOwnershipSnapshot(model)) {
       if (!jsonEqual(model.compat, value)) conflicts.push(finding("cache-mismatch", "warning", target, "Preserved compatibility without an ownership snapshot", false, true));
       continue;

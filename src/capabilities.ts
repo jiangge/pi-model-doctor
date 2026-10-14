@@ -763,7 +763,7 @@ export function capabilityCompat(
     },
   };
   const cacheWarnings: string[] = [];
-  if (cache.prompt === false) compat.supportsPromptCaching = false;
+  if (cache.prompt === false && adapterPolicy.cache.promptField) compat.supportsPromptCaching = false;
   else if (cache.prompt === true && cache.control.prompt && adapterPolicy.cache.promptField && !promptAdvisory) compat.supportsPromptCaching = true;
   compat.cachePromptField = adapterPolicy.cache.promptField;
   if (api === "anthropic-messages" && cache.prompt && cache.control.prompt) {
@@ -785,11 +785,11 @@ export function capabilityCompat(
   if (cache.prompt && adapterPolicy.cache.explicitPromptField) {
     compat.supportsExplicitPromptCacheMode = true;
   }
-  if (cache.context === false) compat.supportsContextCaching = false;
+  if (cache.context === false && adapterPolicy.cache.contextField) compat.supportsContextCaching = false;
   else if (cache.context === true && cache.control.context && adapterPolicy.cache.contextField && !contextAdvisory) compat.supportsContextCaching = true;
   compat.cacheContextField = adapterPolicy.cache.contextField;
   if (cache.context && !adapterPolicy.cache.contextField) cacheWarnings.push("Context cache is detected but has no provider-specific Pi field.");
-  if (cache.kv === false) compat.supportsKvCache = false;
+  if (cache.kv === false && adapterPolicy.cache.kvField) compat.supportsKvCache = false;
   else if (cache.kv === true && cache.control.kv && adapterPolicy.cache.kvField && !kvAdvisory) compat.supportsKvCache = true;
   compat.cacheKvField = adapterPolicy.cache.kvField;
   if (cache.kv && !adapterPolicy.cache.kvField) cacheWarnings.push("KV cache is detected but has no provider-specific Pi field.");
@@ -891,7 +891,43 @@ export function capabilityCompat(
     if (reasoningWarnings.length > 0) compat.reasoningWarnings = [...new Set(reasoningWarnings)];
   }
   if (isGoogleApi(api) && reasoning.supported) compat.supportsTemperature = source.temperature === true;
-  return Object.keys(compat).length === 0 ? undefined : compat;
+  return omitUnknownCacheCompat(compat, cache);
+}
+
+/** Runtime projection only; normalized evidence stays intact for reports/cache. */
+export function omitUnknownCacheCompat(compat: PiCompat, cache: NormalizedCache): PiCompat {
+  const capabilities: NonNullable<PiCompat["cacheCapabilities"]> = {};
+  const resolution: NonNullable<PiCompat["cacheResolution"]> = { confidence: cache.confidence, source: cache.source };
+  const control: NonNullable<NonNullable<PiCompat["cacheResolution"]>["control"]> = {};
+  for (const signal of ["prompt", "context", "kv"] as const) {
+    if (cache[signal] !== null) {
+      capabilities[signal] = cache[signal];
+      resolution[signal] = compat.cacheResolution?.[signal];
+      if (cache.control[signal]) control[signal] = true;
+    }
+  }
+  if (Object.keys(control).length) resolution.control = control;
+  if (cache.readPricing || cache.writePricing) {
+    const pricing = { ...(cache.readPricing ? { read: true } : {}), ...(cache.writePricing ? { write: true } : {}) };
+    resolution.pricing = pricing;
+    if (cache.readPricing) capabilities.readPricing = true;
+    if (cache.writePricing) capabilities.writePricing = true;
+  }
+  if (cache.usageReporting.readTokens || cache.usageReporting.writeTokens) resolution.usageReporting = {
+    ...(cache.usageReporting.readTokens ? { readTokens: true } : {}),
+    ...(cache.usageReporting.writeTokens ? { writeTokens: true } : {}),
+  };
+  if (cache.retention.supported) resolution.retention = cache.retention;
+  if (cache.sessionAffinity.supported) resolution.sessionAffinity = cache.sessionAffinity;
+  delete compat.cacheCapabilities;
+  delete compat.cacheResolution;
+  if (Object.keys(capabilities).length) compat.cacheCapabilities = capabilities;
+  if (Object.keys(resolution).length > 2) compat.cacheResolution = resolution;
+  // Field names without evidence are not runtime controls either.
+  for (const [signal, field] of [["prompt", "cachePromptField"], ["context", "cacheContextField"], ["kv", "cacheKvField"]] as const) {
+    if (cache[signal] !== true || !cache.control[signal]) delete compat[field];
+  }
+  return compat;
 }
 
 export function toThinkingLevelMap(reasoning: NormalizedReasoning): Partial<Record<ReasoningLevel, string | null>> | undefined {

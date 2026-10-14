@@ -376,9 +376,9 @@ test("unknown channel sync and legacy fallback fix preserve ownership and dry-ru
   const synced = sync.config.providers?.windhub?.models?.[0];
   assert.ok(synced?.compat);
   assert.equal(synced.compat.supportsKvCache, undefined);
-  assert.equal(synced.compat.cacheCapabilities?.kv, null);
-  assert.equal(synced.compat.cacheResolution?.confidence, "low");
-  assert.deepEqual(synced.compat.cacheResolution?.pricing, { read: false, write: false });
+  assert.equal(synced.compat.cacheCapabilities, undefined);
+  assert.equal(synced.compat.cacheResolution, undefined);
+  assert.equal(resolveCache(undefined, undefined, "fallback").confidence, "low");
   assert.equal(await readFile(targetPaths.modelsPath, "utf8"), JSON.stringify(initial));
   assert.deepEqual(await readdir(root), ["models.json"]);
 
@@ -386,7 +386,7 @@ test("unknown channel sync and legacy fallback fix preserve ownership and dry-ru
   const legacy = synced;
   assert.ok(legacy.compat);
   legacy.compat.cacheCapabilities = { prompt: false, context: false, kv: false, readPricing: true, writePricing: true };
-  legacy.compat.cacheResolution = { ...legacy.compat.cacheResolution!, prompt: "unsupported", context: "unsupported", kv: "unsupported", pricing: { read: true, write: true }, confidence: "medium" };
+  legacy.compat.cacheResolution = { source: "fallback", prompt: "unsupported", context: "unsupported", kv: "unsupported", pricing: { read: true, write: true }, confidence: "medium" };
   legacy.compat.supportsPromptCaching = false;
   legacy.compat.supportsContextCaching = false;
   legacy.compat.supportsKvCache = false;
@@ -395,11 +395,11 @@ test("unknown channel sync and legacy fallback fix preserve ownership and dry-ru
   const before = await readFile(targetPaths.modelsPath, "utf8");
   const migratedSync = await doctor.proposeSync({ target: "windhub", modelIds: ["unknown-native-id"], dryRun: true });
   assert.equal(migratedSync.config.providers?.windhub?.models?.[0]?.compat?.supportsKvCache, undefined);
-  assert.equal(migratedSync.config.providers?.windhub?.models?.[0]?.compat?.cacheResolution?.kv, "unknown");
+  assert.equal(migratedSync.config.providers?.windhub?.models?.[0]?.compat?.cacheResolution, undefined);
   const fix = await doctor.proposeFix("windhub/unknown-native-id", { persistCache: false });
   const corrected = fix.config.providers?.windhub?.models?.[0];
   assert.equal(corrected?.compat?.supportsKvCache, undefined);
-  assert.equal(corrected?.compat?.cacheResolution?.kv, "unknown");
+  assert.equal(corrected?.compat?.cacheResolution, undefined);
   assert.equal(canManageField(corrected!, "compat"), true);
   assert.equal(await readFile(targetPaths.modelsPath, "utf8"), before);
   for (const ownership of ["no-snapshot", "unmanaged"] as const) {
@@ -413,6 +413,32 @@ test("unknown channel sync and legacy fallback fix preserve ownership and dry-ru
     const preservedSync = await doctor.proposeSync({ target: "windhub", modelIds: ["unknown-native-id"], dryRun: true });
     assert.deepEqual(preservedSync.config.providers?.windhub?.models?.[0]?.compat, entry.compat);
   }
+  // The intermediate tri-state runtime representation is also migrated.
+  legacy.compat.cacheCapabilities = { prompt: null, context: null, kv: null, readPricing: false, writePricing: false };
+  legacy.compat.cacheResolution = { source: "fallback", confidence: "low", prompt: "unknown", context: "unknown", kv: "unknown" };
+  legacy.compat.supportsKvCache = false;
+  legacy.compat.optimizerExtension = { keep: true };
+  legacy.compat.cacheOptimizerCustom = { keep: true };
+  legacy.compat.supportsPromptCacheKey = true;
+  legacy.compat.sendSessionAffinityHeaders = true;
+  legacy.compat.cacheControlFormat = "anthropic";
+  legacy._piModelDoctor!.managedValues!.compat = structuredClone(legacy.compat);
+  await writeFile(targetPaths.modelsPath, JSON.stringify(sync.config));
+  const cleaned = await doctor.proposeFix("windhub/unknown-native-id", { persistCache: false });
+  const cleanModel = cleaned.config.providers?.windhub?.models?.[0];
+  assert.equal(cleanModel?.compat?.cacheCapabilities, undefined);
+  assert.equal(cleanModel?.compat?.cacheResolution, undefined);
+  assert.deepEqual(cleanModel?.compat?.optimizerExtension, { keep: true });
+  for (const projected of [cleanModel, (await doctor.proposeSync({ target: "windhub", modelIds: ["unknown-native-id"], dryRun: true })).config.providers?.windhub?.models?.[0]]) {
+    assert.deepEqual(projected?.compat?.cacheOptimizerCustom, { keep: true });
+    assert.equal(projected?.compat?.supportsPromptCacheKey, true);
+    assert.equal(projected?.compat?.sendSessionAffinityHeaders, true);
+    assert.equal(projected?.compat?.cacheControlFormat, "anthropic");
+  }
+  assert.equal(canManageField(cleanModel!, "compat"), true);
+  await writeFile(targetPaths.modelsPath, JSON.stringify(cleaned.config));
+  const repeat = await doctor.proposeFix("windhub/unknown-native-id", { persistCache: false });
+  assert.equal(repeat.result.plan?.changes.length ?? 0, 0);
   for (const manual of [false, true]) {
     legacy.compat.supportsKvCache = manual;
     legacy.compat.userMarker = "manual override";
@@ -430,12 +456,23 @@ test("cache evidence distinguishes missing, denial, support, and real zero prici
     const normalized = resolveCache(undefined, model);
     const pi = toPiModel({ id: "custom", models: {} }, model);
     assert.equal(normalized.kv, value ?? null);
-    assert.equal(pi.compat?.cacheResolution?.kv, value === undefined ? "unknown" : value ? "advisory" : "unsupported");
-    assert.equal(pi.compat?.supportsKvCache, value === false ? false : undefined);
-    assert.equal(pi.compat?.cacheCapabilities?.kv, value ?? null);
+    assert.equal(pi.compat?.cacheResolution?.kv, value === undefined ? undefined : value ? "advisory" : "unsupported");
+    assert.equal(pi.compat?.supportsKvCache, undefined);
+    assert.equal(pi.compat?.cacheCapabilities?.kv, value);
   }
   const priced = { id: "free-cache", cost: { cache_read: 0, cache_write: 0 } };
   assert.deepEqual(resolveCache(undefined, priced).pricing, { read: true, write: true });
+  const runtimePriced = toPiModel({ id: "custom", models: {} }, priced);
+  assert.deepEqual(runtimePriced.compat?.cacheCapabilities, { readPricing: true, writePricing: true });
+  assert.deepEqual(runtimePriced.compat?.cacheResolution?.pricing, { read: true, write: true });
+  assert.equal(runtimePriced.cost?.cacheRead, 0);
+  const partial = toPiModel({ id: "custom", models: {} }, { id: "partial", interleaved: { prompt_cache: true, kv_cache: false } });
+  assert.deepEqual(partial.compat?.cacheCapabilities, { prompt: true, kv: false });
+  assert.equal(partial.compat?.cacheResolution?.context, undefined);
+  assert.equal(partial.compat?.cacheResolution?.kv, "unsupported");
+  assert.equal(partial.compat?.cacheResolution?.retention, undefined);
+  assert.equal(partial.compat?.cacheResolution?.sessionAffinity, undefined);
+  assert.equal(partial.compat?.cacheResolution?.control, undefined);
   const fallback = resolveCache(undefined, priced, "fallback");
   assert.deepEqual(fallback.pricing, { read: false, write: false });
   assert.equal(fallback.confidence, "low");
@@ -453,7 +490,8 @@ test("cache evidence rejects truthy denial labels and gives explicit denial prec
   for (const label of ["false", "unsupported", "disabled", "unavailable", "no"]) {
     const model = { id: "denied", interleaved: { kv_cache: label, description: "kv_cache" } };
     assert.equal(resolveCache(undefined, model).kv, false);
-    assert.equal(toPiModel({ id: "custom", models: {} }, model).compat?.supportsKvCache, false);
+    assert.equal(toPiModel({ id: "custom", models: {} }, model).compat?.supportsKvCache, undefined);
+    assert.equal(toPiModel({ id: "custom", models: {} }, model).compat?.cacheCapabilities?.kv, false);
   }
   for (const label of ["true", "supported", "enabled"]) assert.equal(resolveCache(undefined, { id: "supported", interleaved: { kv_cache: label } }).kv, true);
   assert.equal(resolveCache(undefined, { id: "unknown", interleaved: { kv_cache: "unrecognized" } }).kv, null);
@@ -487,11 +525,11 @@ test("resolves provider adapters and independent cache capabilities", () => {
   assert.equal(resolveProviderAdapter({ id: "bedrock", models: {} }).id, "fallback");
   assert.equal(resolveProviderAdapter({ id: "pi-messages", models: {} }).id, "fallback");
   assert.equal(defaultPolicyCatalog().schemaVersion, 1);
-  assert.equal(compat?.cacheCapabilities?.prompt, null);
+  assert.equal(compat?.cacheCapabilities?.prompt, undefined);
   assert.equal(compat?.cacheCapabilities?.context, true);
-  assert.equal(compat?.cacheCapabilities?.readPricing, false);
+  assert.equal(compat?.cacheCapabilities?.readPricing, undefined);
   assert.equal(compat?.cacheCapabilities?.kv, true);
-  assert.deepEqual(compat?.cacheResolution?.pricing, { read: false, write: false });
+  assert.equal(compat?.cacheResolution?.pricing, undefined);
   assert.equal(compat?.cacheResolution?.source, "models.dev");
 });
 

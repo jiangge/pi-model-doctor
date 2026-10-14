@@ -99,21 +99,21 @@ export interface PiCompat extends JsonObject {
   cacheContextField?: string;
   cacheKvField?: string;
   cacheCapabilities?: {
-    prompt: CacheEvidence;
-    context: CacheEvidence;
-    kv: CacheEvidence;
-    readPricing: boolean;
-    writePricing: boolean;
+    prompt?: CacheEvidence;
+    context?: CacheEvidence;
+    kv?: CacheEvidence;
+    readPricing?: boolean;
+    writePricing?: boolean;
   };
   cacheResolution?: {
-    prompt: CapabilityResolutionLevel;
-    context: CapabilityResolutionLevel;
-    kv: CapabilityResolutionLevel;
-    control: { prompt: boolean; context: boolean; kv: boolean };
-    pricing: { read: boolean; write: boolean };
-    usageReporting: { readTokens: boolean; writeTokens: boolean };
-    retention: { supported: boolean; values: string[] };
-    sessionAffinity: { supported: boolean; format?: string };
+    prompt?: CapabilityResolutionLevel;
+    context?: CapabilityResolutionLevel;
+    kv?: CapabilityResolutionLevel;
+    control?: { prompt?: boolean; context?: boolean; kv?: boolean };
+    pricing?: { read?: boolean; write?: boolean };
+    usageReporting?: { readTokens?: boolean; writeTokens?: boolean };
+    retention?: { supported: boolean; values: string[] };
+    sessionAffinity?: { supported: boolean; format?: string };
     confidence: "high" | "medium" | "low";
     source: "pi" | "provider" | "models.dev" | "fallback";
   };
