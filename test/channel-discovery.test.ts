@@ -228,7 +228,7 @@ test("live IDs override catalog ambiguity/case variants and catalog fallback sta
   const proposal = await doctor.proposeSync({ target: "channel", modelIds: ["Shared", "shared"], dryRun: true });
   assert.deepEqual(proposal.modelIds, ["Shared", "shared"]);
   assert.deepEqual(proposal.config.providers?.channel.models?.map((model) => model.id), ["Shared", "shared"]);
-  assert.ok(proposal.warnings.some((warning) => /Ambiguous metadata/.test(warning)));
+  assert.ok(proposal.warnings.some((warning) => /Official metadata source unknown.*conservative defaults/.test(warning)));
   const urlDoctor = new ModelDoctor({ paths, channelFetch: async () => { throw new Error("must not call Anthropic discovery"); }, fetcher: { fetchImpl: async () => Response.json({ anthropic: { id: "anthropic", api: "https://api.anthropic.com", npm: "@ai-sdk/anthropic", models: { claude: { id: "claude" } } } }) } });
   const result = await urlDoctor.discoverSync({ target: "https://api.anthropic.com", modelIds: [] });
   assert.equal(result.source, "models.dev");

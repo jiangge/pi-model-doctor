@@ -468,6 +468,7 @@ async function runSync(args: string[], flags: Record<string, string | boolean>, 
   const preview = [
     `Sync ${redactSensitiveText(proposal.target)}`,
     `Models: ${proposal.modelIds.map((modelId) => redactSensitiveText(modelId)).join(", ")}`,
+    ...proposal.metadataSources.map((source) => `Metadata source: ${redactSensitiveText(source.modelId)} → ${redactSensitiveText(source.providerId)}/${redactSensitiveText(source.modelId)} (${source.reason})${source.verifiedAt ? `; verified ${source.verifiedAt}` : ""}${source.evidence.length ? `; evidence: ${source.evidence.join(", ")}` : ""}`),
     proposal.warnings.length > 0 ? `Warnings:\n${proposal.warnings.map((warning) => `⚠ ${redactSensitiveText(warning)}`).join("\n")}` : undefined,
     formatPlan(proposal.plan),
   ].filter(Boolean).join("\n");
@@ -476,7 +477,7 @@ async function runSync(args: string[], flags: Record<string, string | boolean>, 
     return;
   }
   if (proposal.plan.changes.length === 0) {
-    ctx.ui.notify(`${preview}\nNo changes needed.\nStatus: not-persisted.`, "info");
+    ctx.ui.notify(`${preview}\nNo changes needed.\nStatus: already-persisted (no write or backup was needed).`, "info");
     return;
   }
   await requireAuthorization(ctx, flags, "sync", preview);
@@ -580,6 +581,7 @@ async function runAdd(args: string[], flags: Record<string, string | boolean>, c
     `Proposed ${redactSensitiveText(proposal.target)}`,
     `Source: ${proposal.catalogSource}; matched by: ${proposal.matchedBy.join(", ") || "explicit fallback"}`,
     proposal.metadataProviderId ? `Metadata provider: ${redactSensitiveText(proposal.metadataProviderId)} (channel transport and credentials remain unchanged)` : undefined,
+    proposal.metadataProvenance ? `Metadata provenance: ${proposal.metadataProvenance.reason}; source model ${redactSensitiveText(proposal.metadataProvenance.providerId)}/${redactSensitiveText(proposal.metadataProvenance.modelId)}${proposal.metadataProvenance.verifiedAt ? `; verified ${proposal.metadataProvenance.verifiedAt}` : ""}${proposal.metadataProvenance.evidence.length ? `; evidence: ${proposal.metadataProvenance.evidence.join(", ")}` : ""}` : undefined,
     `Adapter: ${proposal.adapter}; confidence: ${proposal.confidence}; reasoning: ${proposal.reasoningControlType}; cache: prompt=${proposal.cacheCapabilities.prompt ?? "unknown"}, context=${proposal.cacheCapabilities.context ?? "unknown"}, kv=${proposal.cacheCapabilities.kv ?? "unknown"}`,
     `Required headers: ${proposal.requiredHeaders.length > 0 ? proposal.requiredHeaders.join(", ") : "none detected"} (values are never displayed)`,
     proposal.warning ? `Warning: ${redactSensitiveText(proposal.warning)}` : undefined,
@@ -667,7 +669,7 @@ async function runFix(args: string[], flags: Record<string, string | boolean>, c
     return;
   }
   if (!proposal.result.plan || proposal.result.plan.changes.length === 0) {
-    ctx.ui.notify(`${preview}\nNo changes needed.\nStatus: not-persisted.`, "info");
+    ctx.ui.notify(`${preview}\nNo changes needed.\nStatus: already-persisted (no write or backup was needed).`, "info");
     return;
   }
   await requireAuthorization(ctx, flags, "fix", `${preview}\n${formatPlan(proposal.result.plan)}`);

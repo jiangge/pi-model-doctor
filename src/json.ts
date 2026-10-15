@@ -164,6 +164,7 @@ export function buildMetadata(
     ...(compatiblePrevious ?? {}),
     managed: true,
     source: details.source,
+    ...(details.metadataProvenance ? { metadataProvenance: cloneJson(details.metadataProvenance) } : {}),
     lastCheck: details.lastCheck,
     autoRepair: details.autoRepair,
     version: MODEL_DOCTOR_VERSION,

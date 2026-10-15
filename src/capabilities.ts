@@ -1,3 +1,4 @@
+import { metadataProvenance as resolveMetadataProvenance } from "./publisher-registry.ts";
 import { isRecord, looksLikeCredentialValue } from "./json.ts";
 import type {
   AdapterPolicy,
@@ -11,6 +12,7 @@ import type {
   PiCost,
   CapabilityResolutionLevel,
   PiModel,
+  MetadataProvenance,
   PolicyCatalog,
   ReasoningLevel,
 } from "./types.ts";
@@ -603,29 +605,39 @@ export function resolveCapabilities(
 export function toPiModel(
   provider: ModelsDevProvider,
   source: ModelsDevModel,
-  options: { endpoint?: string; now?: Date; sourceName?: string; capabilitySource?: NormalizedCache["source"]; policy?: PolicyCatalog; api?: PiApi; metadataOnly?: boolean; transportOwned?: boolean; providerId?: string; adapterProviderId?: string } = {},
+  options: { endpoint?: string; now?: Date; sourceName?: string; capabilitySource?: NormalizedCache["source"]; policy?: PolicyCatalog; api?: PiApi; metadataOnly?: boolean; transportOwned?: boolean; providerId?: string; adapterProviderId?: string; metadataProvenance?: MetadataProvenance } = {},
 ): PiModel {
+  const catalogMetadataOnly = options.metadataOnly === true && options.capabilitySource !== "fallback";
+  const referenceOnly = options.metadataOnly === true || options.transportOwned === true;
+  const metadataProvenance = options.metadataProvenance ?? resolveMetadataProvenance(provider.id, source.id, {
+    metadataOnly: options.metadataOnly === true,
+    fallback: options.capabilitySource === "fallback",
+  });
+  // Channel pricing and cache execution are not derivable from source-provider metadata.
+  const sourceCost = referenceOnly ? undefined : source.cost;
+  const cache = referenceOnly
+    ? resolveCache({ id: provider.id, models: {} }, { id: source.id }, "fallback")
+    : resolveCache(provider, source, options.capabilitySource);
   const policy = options.policy ?? defaultPolicyCatalog(options.now);
   const api = detectPiApi(provider, options.endpoint ?? provider.api, options.api, source);
   const reasoning = resolveReasoning(provider, source);
-  const cache = resolveCache(provider, source, options.capabilitySource);
   const supportedInput = source.modalities?.input?.filter((value): value is "text" | "image" => value === "text" || value === "image") ?? [];
   const input: Array<"text" | "image"> = supportedInput.length > 0 ? supportedInput : ["text"];
   const cost: PiCost = {
     ...DEFAULT_COST,
-    ...(typeof source.cost?.input === "number" ? { input: source.cost.input } : {}),
-    ...(typeof source.cost?.output === "number" ? { output: source.cost.output } : {}),
-    ...(typeof source.cost?.cache_read === "number" ? { cacheRead: source.cost.cache_read } : {}),
-    ...(typeof source.cost?.cache_write === "number" ? { cacheWrite: source.cost.cache_write } : {}),
-    ...(source.cost?.tiers ? {
-      tiers: source.cost.tiers
+    ...(typeof sourceCost?.input === "number" ? { input: sourceCost.input } : {}),
+    ...(typeof sourceCost?.output === "number" ? { output: sourceCost.output } : {}),
+    ...(typeof sourceCost?.cache_read === "number" ? { cacheRead: sourceCost.cache_read } : {}),
+    ...(typeof sourceCost?.cache_write === "number" ? { cacheWrite: sourceCost.cache_write } : {}),
+    ...(sourceCost?.tiers ? {
+      tiers: sourceCost.tiers
         .filter((tier) => typeof tier.inputTokensAbove === "number")
         .map((tier) => ({
           inputTokensAbove: tier.inputTokensAbove as number,
-          input: typeof tier.input === "number" ? tier.input : (typeof source.cost?.input === "number" ? source.cost.input : 0),
-          output: typeof tier.output === "number" ? tier.output : (typeof source.cost?.output === "number" ? source.cost.output : 0),
-          cacheRead: typeof tier.cache_read === "number" ? tier.cache_read : (typeof source.cost?.cache_read === "number" ? source.cost.cache_read : 0),
-          cacheWrite: typeof tier.cache_write === "number" ? tier.cache_write : (typeof source.cost?.cache_write === "number" ? source.cost.cache_write : 0),
+          input: typeof tier.input === "number" ? tier.input : (typeof sourceCost?.input === "number" ? sourceCost.input : 0),
+          output: typeof tier.output === "number" ? tier.output : (typeof sourceCost?.output === "number" ? sourceCost.output : 0),
+          cacheRead: typeof tier.cache_read === "number" ? tier.cache_read : (typeof sourceCost?.cache_read === "number" ? sourceCost.cache_read : 0),
+          cacheWrite: typeof tier.cache_write === "number" ? tier.cache_write : (typeof sourceCost?.cache_write === "number" ? sourceCost.cache_write : 0),
         })),
     } : {}),
   };
@@ -635,10 +647,10 @@ export function toPiModel(
     api,
     reasoning: reasoning.supported,
     input,
-    cost,
+    ...(referenceOnly ? {} : { cost }),
     contextWindow: source.limit?.context && source.limit.context > 0 ? source.limit.context : 128_000,
     maxTokens: source.limit?.output && source.limit.output > 0 ? source.limit.output : DEFAULT_MAX_TOKENS,
-    compat: capabilityCompat(api, cache, reasoning, source, provider.id, policy, options.endpoint ?? provider.api, options.metadataOnly, options.transportOwned, options.adapterProviderId),
+    compat: capabilityCompat(api, cache, reasoning, source, provider.id, policy, options.endpoint ?? provider.api, catalogMetadataOnly, options.transportOwned, options.adapterProviderId),
   };
   const thinkingLevelMap = toThinkingLevelMap(reasoning);
   if (thinkingLevelMap) model.thinkingLevelMap = thinkingLevelMap;
@@ -650,8 +662,9 @@ export function toPiModel(
       autoRepair: true,
       providerId: options.providerId ?? provider.id,
       modelId: source.id,
+      metadataProvenance,
       version: 1,
-      managedFields: ["name", ...(options.metadataOnly || options.transportOwned ? [] : ["api"]), "reasoning", "thinkingLevelMap", "input", "cost", "contextWindow", "maxTokens", "compat"],
+      managedFields: ["name", ...(options.metadataOnly || options.transportOwned ? [] : ["api"]), "reasoning", "thinkingLevelMap", "input", ...(referenceOnly ? [] : ["cost"]), "contextWindow", "maxTokens", "compat"],
       managedValues: {},
     };
     const fields = model._piModelDoctor.managedFields ?? [];

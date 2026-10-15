@@ -1,3 +1,4 @@
+import { publisherRule } from "./publisher-registry.ts";
 import { CacheStore } from "./cache.ts";
 import { isLoopbackHost, isPrivateHost, isSafeProviderApiUrl } from "./catalog-url.ts";
 import { errorMessage, isRecord, isSafeHeaderName, looksLikeCredentialValue, redactSensitiveText } from "./json.ts";
@@ -291,7 +292,7 @@ export class ModelsDevClient {
     const bestScore = matches[0]?.score ?? 0;
     const bestMatches = matches.filter((match) => match.score === bestScore);
     if (bestMatches.length > 1) {
-      const official = metadataProvider ? undefined : selectOfficialMetadataMatch(bestMatches);
+      const official = metadataProvider ? undefined : selectOfficialMetadataMatch(bestMatches, modelId);
       if (official) {
         return {
           ...official,
@@ -739,22 +740,14 @@ function globalModelMatches(catalog: ModelsDevCatalog, modelId: string, metadata
   return sortProviderMatches(matches);
 }
 
-function selectOfficialMetadataMatch(matches: ProviderMatch[]): ProviderMatch | undefined {
-  const officialMatches = matches.filter((match) => {
-    const providerPackage = match.provider.npm;
-    if (typeof providerPackage !== "string") return false;
-    const packageMatch = /^@ai-sdk\/([a-z0-9-]+)$/u.exec(providerPackage);
-    return packageMatch !== null && normalize(match.provider.id) === normalize(packageMatch[1]);
-  });
-  const declaredProviderPackages = new Set(matches.flatMap((match) => {
-    const metadata = match.model?.provider;
-    return isRecord(metadata) && typeof metadata.npm === "string" ? [metadata.npm] : [];
-  }));
-  const declaredOfficialMatches = declaredProviderPackages.size > 0
-    ? officialMatches.filter((match) => declaredProviderPackages.has(match.provider.npm ?? ""))
-    : [];
-  if (declaredOfficialMatches.length === 1) return declaredOfficialMatches[0];
-  return declaredProviderPackages.size === 0 && officialMatches.length === 1 ? officialMatches[0] : undefined;
+function selectOfficialMetadataMatch(matches: ProviderMatch[], requestedModelId: string): ProviderMatch | undefined {
+  // An SDK identifies a transport adapter, not the publisher of a model.
+  // Registry attribution is exact and case-sensitive; display-name or variant
+  // matches may aid discovery but must never become publisher evidence.
+  const rule = publisherRule(requestedModelId);
+  if (!rule) return undefined;
+  const official = matches.filter((match) => match.model?.id === requestedModelId && match.provider.id === rule.providerId);
+  return official.length === 1 ? official[0] : undefined;
 }
 
 function allCatalogMatches(catalog: ModelsDevCatalog, metadataProvider?: string): ProviderMatch[] {

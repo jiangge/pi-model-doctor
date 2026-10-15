@@ -671,7 +671,7 @@ test("uses official model metadata for an unlisted third-party channel without r
   assert.equal((await readModelsJson(targetPaths.modelsPath)).data.providers?.[proposal.providerId]?.baseUrl, "https://third-party.example/v1");
 });
 
-test("automatically uses the official metadata provider for an unlisted channel", async () => {
+test("SDK adapter packages do not establish official model authorship for an unlisted channel", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-model-doctor-third-party-official-metadata-"));
   const targetPaths = paths(root);
   await writeFile(targetPaths.modelsPath, JSON.stringify({
@@ -706,9 +706,11 @@ test("automatically uses the official metadata provider for an unlisted channel"
     },
   });
   const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(duplicateCatalog) } });
-  const proposal = await doctor.proposeAdd({ target: "wong", modelId: "gpt-official", persistCache: false });
+  // SDK packages describe adapters and must never prove authorship.
+  await assert.rejects(() => doctor.proposeAdd({ target: "wong", modelId: "gpt-official", persistCache: false }), (error: unknown) => error instanceof DoctorError && error.code === "selection-required");
+  const proposal = await doctor.proposeAdd({ target: "wong", modelId: "gpt-official", metadataProvider: "openai", persistCache: false });
   assert.equal(proposal.metadataProviderId, "openai");
-  assert.equal(proposal.matchedBy.includes("official-metadata-provider"), true);
+  assert.equal(proposal.matchedBy.includes("official-metadata-provider"), false);
   assert.equal(proposal.config.providers?.wong?.models?.[0]?.contextWindow, 200000);
   assert.equal(proposal.config.providers?.wong?.baseUrl, "https://wong.example/v1");
   assert.equal(proposal.config.providers?.wong?.apiKey, "$WONG_API_KEY");
@@ -729,9 +731,10 @@ test("automatically uses the official metadata provider for an unlisted channel"
     },
   });
   const implicitDoctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(implicitCatalog) } });
-  const implicit = await implicitDoctor.proposeAdd({ target: "wong", modelId: "claude-official", persistCache: false });
-  assert.equal(implicit.metadataProviderId, "anthropic");
-  assert.equal(implicit.config.providers?.wong?.models?.[0]?.contextWindow, 300000);
+  await assert.rejects(() => implicitDoctor.proposeAdd({ target: "wong", modelId: "claude-official", persistCache: false }), (error: unknown) => error instanceof DoctorError && error.code === "selection-required");
+  const explicit = await implicitDoctor.proposeAdd({ target: "wong", modelId: "claude-official", metadataProvider: "anthropic", persistCache: false });
+  assert.equal(explicit.metadataProviderId, "anthropic");
+  assert.equal(explicit.config.providers?.wong?.models?.[0]?.contextWindow, 300000);
 });
 
 test("requires an explicit metadata provider when a third-party model id is ambiguous", async () => {
@@ -2340,7 +2343,7 @@ test("add command reports successful dry-runs and metadata-provider selection", 
   const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(duplicateCatalog) } });
   const notifications: string[] = [];
   const ctx = { hasUI: false, ui: { notify: (message: string) => notifications.push(message) } } as never;
-  await runCommand("add wong gpt-official --dry-run", ctx, doctor);
+  await runCommand("add wong gpt-official --metadata-provider openai --dry-run", ctx, doctor);
   assert.match(notifications.at(-1) ?? "", /Dry-run succeeded for wong\/gpt-official/);
   assert.match(notifications.at(-1) ?? "", /Metadata provider: openai/);
   assert.match(notifications.at(-1) ?? "", /not-persisted \(dry-run\)/);
@@ -2839,4 +2842,174 @@ test("headless dry-run takes precedence over --yes for mutations", async () => {
   assert.match(notifications.at(-1) ?? "", /not-persisted.*dry-run/i);
   await assert.rejects(() => readFile(targetPaths.modelsPath));
   await assert.rejects(() => readFile(targetPaths.modelsCachePath));
+});
+
+
+test("reviewed GLM publisher metadata is bounded, dynamic and channel-owned", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-publisher-"));
+  const targetPaths = paths(root);
+  await writeFile(targetPaths.modelsPath, JSON.stringify({ providers: { windhub: { baseUrl: "https://windhub.example/v1", api: "openai-completions", apiKey: "$WIND_KEY", headers: { "x-channel": "keep" }, models: [] } } }));
+  const data = normalizeCatalog({
+    zai: { id: "zai", api: "https://api.z.ai/api/paas/v4", npm: "@ai-sdk/openai-compatible", models: { "glm-5.3": { id: "glm-5.3", limit: { context: 1000000, output: 12345 }, cost: { input: 99, output: 99 } } } },
+    gateway: { id: "gateway", api: "https://gateway.example/v1", npm: "@ai-sdk/gateway", models: { "glm-5.3": { id: "glm-5.3", limit: { context: 128000 } } } },
+  });
+  const doctor = new ModelDoctor({ paths: targetPaths, fetcher: { fetchImpl: fetchMock(data) } });
+  const proposal = await doctor.proposeAdd({ target: "windhub", modelId: "glm-5.3", dryRun: true });
+  const provider = proposal.config.providers!.windhub!;
+  const model = provider.models![0]!;
+  assert.equal(model.contextWindow, 1000000);
+  assert.equal(model.maxTokens, 12345);
+  assert.equal(model.cost, undefined);
+  assert.equal(model._piModelDoctor?.metadataProvenance?.reason, "official-reference");
+  assert.deepEqual(model._piModelDoctor?.metadataProvenance?.evidence, [
+    "https://docs.z.ai/guides/llm/glm-5.3",
+    "https://docs.z.ai/api-reference/introduction",
+  ]);
+  assert.equal(model._piModelDoctor?.metadataProvenance?.verifiedAt, "2026-10-15");
+  assert.match(proposal.warning!, /official metadata as the default fallback/);
+  assert.equal(provider.baseUrl, "https://windhub.example/v1");
+  assert.equal(provider.api, "openai-completions");
+  assert.equal(provider.apiKey, "$WIND_KEY");
+  assert.deepEqual(provider.headers, { "x-channel": "keep" });
+  const override = await doctor.proposeAdd({ target: "windhub", modelId: "glm-5.3", metadataProvider: "gateway", dryRun: true });
+  assert.equal(override.config.providers!.windhub!.models![0]!.contextWindow, 128000);
+  assert.equal(override.config.providers!.windhub!.models![0]!._piModelDoctor?.metadataProvenance?.reason, "explicit-provider");
+  const gatewayOnly = normalizeCatalog({ gateway: { id: "gateway", api: "https://gateway.example/v1", models: { "glm-5.3": { id: "glm-5.3", limit: { context: 128000 } } } } });
+  const unverified = new ModelDoctor({ paths: paths(await mkdtemp(join(tmpdir(), "pi-publisher-absent-source-"))), fetcher: { fetchImpl: fetchMock(gatewayOnly) } });
+  const unverifiedProposal = await unverified.proposeAdd({ target: "https://new-channel.example/v1", modelId: "glm-5.3", dryRun: true, persistCache: false });
+  assert.equal(unverifiedProposal.metadataProvenance?.reason, "catalog-reference");
+  assert.match(unverifiedProposal.warning ?? "", /official publisher is unverified/);
+  assert.notEqual(ModelsDevClient.findGlobalModel(gatewayOnly, "glm-5.3")?.matchedBy.includes("official-metadata-provider"), true);
+  for (const id of ["glm-5.3-thinking", "GLM-5.3", "ft:glm-5.3", "glm-5.3-custom"]) {
+    const candidate = ModelsDevClient.findGlobalModel(data, id);
+    assert.notEqual(candidate?.matchedBy.includes("official-metadata-provider"), true, `must not attribute ${id} to the publisher registry`);
+  }
+  await doctor.applyAdd({ ...proposal, dryRun: false });
+  const persisted = JSON.parse(await readFile(targetPaths.modelsPath, "utf8"));
+  assert.equal(persisted.providers.windhub.baseUrl, "https://windhub.example/v1");
+  assert.equal(persisted.providers.windhub.api, "openai-completions");
+  assert.equal(persisted.providers.windhub.apiKey, "$WIND_KEY");
+  assert.deepEqual(persisted.providers.windhub.headers, { "x-channel": "keep" });
+  assert.deepEqual(persisted.providers.windhub.models[0]._piModelDoctor.metadataProvenance, {
+    providerId: "zai",
+    modelId: "glm-5.3",
+    reason: "official-reference",
+    evidence: [
+      "https://docs.z.ai/guides/llm/glm-5.3",
+      "https://docs.z.ai/api-reference/introduction",
+    ],
+    verifiedAt: "2026-10-15",
+  });
+  const again = await doctor.proposeAdd({ target: "windhub", modelId: "glm-5.3", dryRun: true });
+  assert.equal(again.plan.changes.length, 0);
+  const checked = await doctor.check("windhub/glm-5.3");
+  assert.ok(checked.findings.some((finding) => /default official-reference fallback/.test(finding.message)));
+  const fixed = await doctor.proposeFix("windhub/glm-5.3", { persistCache: false, dryRun: true });
+  assert.equal(fixed.result.plan?.changes.length, 0);
+  assert.equal((await readModelsJson(targetPaths.modelsPath)).data.providers?.windhub?.models?.[0]?._piModelDoctor?.metadataProvenance?.providerId, "zai");
+});
+
+test("sync resolves reviewed publisher metadata per model and reports provenance across dry-run/write/no-op", async (t) => {
+  const previousWindKey = process.env.WIND_KEY;
+  process.env.WIND_KEY = "test-only-windhub-key";
+  t.after(() => {
+    if (previousWindKey === undefined) delete process.env.WIND_KEY;
+    else process.env.WIND_KEY = previousWindKey;
+  });
+  const root = await mkdtemp(join(tmpdir(), "pi-publisher-sync-"));
+  const targetPaths = paths(root);
+  await writeFile(targetPaths.modelsPath, JSON.stringify({ providers: { windhub: { baseUrl: "https://windhub.example/v1", api: "openai-completions", apiKey: "$WIND_KEY", headers: { "x-channel": "keep" }, models: [{ id: "glm-5.3", cost: { input: 0.42, output: 0.84, cacheRead: 0, cacheWrite: 0 } }] } } }));
+  const data = normalizeCatalog({
+    zai: { id: "zai", api: "https://api.z.ai/api/paas/v4", models: { "glm-5.3": { id: "glm-5.3", limit: { context: 1000000, output: 128000 } } } },
+    gateway: { id: "gateway", api: "https://gateway.example/v1", models: { "glm-5.3": { id: "glm-5.3", limit: { context: 128000 } } } },
+  });
+  const doctor = new ModelDoctor({
+    paths: targetPaths,
+    channelFetch: async () => Response.json({ data: [{ id: "glm-5.3" }, { id: "custom-live" }] }),
+    fetcher: { fetchImpl: fetchMock(data) },
+  });
+  const dryRun = await doctor.proposeSync({ target: "windhub", modelIds: ["glm-5.3", "custom-live"], dryRun: true, persistCache: false });
+  assert.equal(dryRun.config.providers?.windhub?.models?.find((model) => model.id === "glm-5.3")?.contextWindow, 1000000);
+  assert.equal(dryRun.config.providers?.windhub?.models?.find((model) => model.id === "custom-live")?.contextWindow, 128000);
+  assert.equal(dryRun.config.providers?.windhub?.baseUrl, "https://windhub.example/v1");
+  assert.equal(dryRun.config.providers?.windhub?.api, "openai-completions");
+  assert.equal(dryRun.config.providers?.windhub?.apiKey, "$WIND_KEY");
+  assert.deepEqual(dryRun.config.providers?.windhub?.headers, { "x-channel": "keep" });
+  assert.equal(dryRun.config.providers?.windhub?.models?.find((model) => model.id === "custom-live")?.cost, undefined);
+  assert.deepEqual(dryRun.metadataSources.map(({ providerId, modelId, reason }) => ({ providerId, modelId, reason })), [
+    { providerId: "zai", modelId: "glm-5.3", reason: "official-reference" },
+    { providerId: "conservative-defaults", modelId: "custom-live", reason: "conservative-defaults" },
+  ]);
+  assert.match(dryRun.warnings.join(" "), /official metadata as the default fallback/);
+  assert.match(dryRun.warnings.join(" "), /custom-live.*conservative defaults/i);
+  assert.deepEqual(await readdir(root), ["models.json"]);
+  const notifications: string[] = [];
+  const ctx = { hasUI: true, ui: { notify: (message: string) => notifications.push(message), confirm: async () => true } } as never;
+  await runCommand("sync windhub --models glm-5.3,custom-live --yes", ctx, doctor);
+  assert.ok(notifications.some((message) => /Metadata source: glm-5.3 → zai\/glm-5.3 \(official-reference\)/.test(message)), notifications.join("\n"));
+  assert.ok(notifications.some((message) => /Status: persisted-reload-required/.test(message)));
+  const persisted = (await readModelsJson(targetPaths.modelsPath)).data.providers?.windhub;
+  assert.equal(persisted?.baseUrl, "https://windhub.example/v1");
+  assert.equal(persisted?.api, "openai-completions");
+  assert.equal(persisted?.apiKey, "$WIND_KEY");
+  assert.deepEqual(persisted?.headers, { "x-channel": "keep" });
+  assert.deepEqual(persisted?.models?.[0]?.cost, { input: 0.42, output: 0.84, cacheRead: 0, cacheWrite: 0 });
+  assert.deepEqual(persisted?.models?.[0]?._piModelDoctor?.metadataProvenance, {
+    providerId: "zai",
+    modelId: "glm-5.3",
+    reason: "official-reference",
+    evidence: [
+      "https://docs.z.ai/guides/llm/glm-5.3",
+      "https://docs.z.ai/api-reference/introduction",
+    ],
+    verifiedAt: "2026-10-15",
+  });
+  notifications.length = 0;
+  const beforeDryRun = await readFile(targetPaths.modelsPath, "utf8");
+  await runCommand("sync windhub --models glm-5.3,custom-live --dry-run", ctx, doctor);
+  assert.ok(notifications.some((message) => /Metadata source: glm-5.3 → zai\/glm-5.3 \(official-reference\)/.test(message)));
+  assert.ok(notifications.some((message) => /Status: not-persisted \(dry-run\)/.test(message)));
+  assert.equal(await readFile(targetPaths.modelsPath, "utf8"), beforeDryRun);
+  notifications.length = 0;
+  await runCommand("sync windhub --models glm-5.3,custom-live --yes", ctx, doctor);
+  assert.ok(notifications.some((message) => /Metadata source: glm-5.3 → zai\/glm-5.3 \(official-reference\)/.test(message)));
+  assert.ok(notifications.some((message) => /Status: already-persisted/.test(message)));
+});
+
+test("sync retains publisher fallback after discovery degradation and rejects invalid explicit metadata providers", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-publisher-local-fallback-"));
+  const targetPaths = paths(root);
+  await writeFile(targetPaths.modelsPath, JSON.stringify({ providers: { windhub: { baseUrl: "https://windhub.example/v1", api: "openai-completions", headers: { "x-channel": "keep" }, models: [] } } }));
+  const data = normalizeCatalog({
+    zai: { id: "zai", api: "https://api.z.ai/api/paas/v4", models: { "glm-5.3": { id: "glm-5.3", limit: { context: 1000000 } } } },
+    gateway: { id: "gateway", api: "https://gateway.example/v1", models: { "glm-5.3": { id: "glm-5.3", limit: { context: 128000 } } } },
+  });
+  const doctor = new ModelDoctor({ paths: targetPaths, channelFetch: async () => new Response("unavailable", { status: 404 }), fetcher: { fetchImpl: fetchMock(data) } });
+  const discovery = await doctor.discoverSync({ target: "windhub", modelIds: ["glm-5.3"] });
+  assert.equal(discovery.source, "models.dev");
+  const proposal = await doctor.proposeSync({ target: "windhub", modelIds: ["glm-5.3"], discovery, dryRun: true, persistCache: false });
+  assert.equal(proposal.config.providers?.windhub?.models?.[0]?.contextWindow, 1000000);
+  assert.deepEqual(proposal.metadataSources.map((source) => source.providerId), ["zai"]);
+
+  const invalidDiscovery = await doctor.discoverSync({ target: "windhub", modelIds: ["glm-5.3"], metadataProvider: "not-a-provider" });
+  assert.equal(invalidDiscovery.source, "local-explicit");
+  await assert.rejects(
+    () => doctor.proposeSync({ target: "windhub", modelIds: ["glm-5.3"], metadataProvider: "not-a-provider", discovery: invalidDiscovery, dryRun: true, persistCache: false }),
+    (error: unknown) => error instanceof DoctorError && error.code === "invalid-target" && /not-a-provider\/glm-5.3/.test(error.message),
+  );
+});
+
+test("sync prefers exact target-provider metadata over publisher fallback", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-publisher-direct-target-"));
+  const targetPaths = paths(root);
+  await writeFile(targetPaths.modelsPath, JSON.stringify({ providers: { windhub: { baseUrl: "https://windhub.example/v1", api: "openai-completions", models: [] } } }));
+  const data = normalizeCatalog({
+    windhub: { id: "windhub", api: "https://windhub.example/v1", models: { "glm-5.3": { id: "glm-5.3", limit: { context: 160000 } } } },
+    zai: { id: "zai", api: "https://api.z.ai/api/paas/v4", models: { "glm-5.3": { id: "glm-5.3", limit: { context: 1000000 } } } },
+  });
+  const doctor = new ModelDoctor({ paths: targetPaths, channelFetch: async () => Response.json({ data: [{ id: "glm-5.3" }] }), fetcher: { fetchImpl: fetchMock(data) } });
+  const proposal = await doctor.proposeSync({ target: "windhub", modelIds: ["glm-5.3"], dryRun: true, persistCache: false });
+  assert.equal(proposal.config.providers?.windhub?.models?.[0]?.contextWindow, 160000);
+  assert.equal(proposal.metadataSources[0]?.providerId, "windhub");
+  assert.equal(proposal.metadataSources[0]?.reason, "direct-catalog");
 });

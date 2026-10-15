@@ -13,7 +13,7 @@
 - `any` in production modules to bypass type safety.
 - Direct writes to `models.json` without a timestamped backup and atomic rename.
 - Network calls as the only source of truth for local `list`, `check`, or `fix`.
-- Hard-coded finite model/provider rules in place of metadata-driven resolvers.
+- Hard-coded finite model/provider parameter rules in place of metadata-driven resolvers. Narrow exception: a reviewed, exact-model-ID publisher-attribution registry may select which catalog provider supplies metadata; it must contain no numeric limits or capability values, cite official evidence and verification dates, and leave all model parameters dynamically sourced from the catalog.
 - Logging or displaying credentials.
 - Overwriting `headers`, endpoint overrides, temperature, or arbitrary compatibility fields just because models.dev differs.
 

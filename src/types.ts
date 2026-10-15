@@ -18,7 +18,18 @@ export type PiApi = (typeof PI_API_OPTIONS)[number];
 export type ReasoningControlType = "toggle" | "effort" | "budget" | "adaptive" | "unknown";
 export type ReasoningLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
+export type MetadataProvenanceReason = "explicit-provider" | "direct-catalog" | "official-reference" | "catalog-reference" | "conservative-defaults";
+
+export interface MetadataProvenance {
+  providerId: string;
+  modelId: string;
+  reason: MetadataProvenanceReason;
+  evidence: string[];
+  verifiedAt?: string;
+}
+
 export interface DoctorMetadata {
+  metadataProvenance?: MetadataProvenance;
   managed: true;
   source: string;
   lastCheck: string;
@@ -490,6 +501,8 @@ export interface AddInput {
   modelId?: string;
   /** Optional models.dev provider id used only to disambiguate metadata. */
   metadataProvider?: string;
+  /** Internal sync marker: distinguishes user selection from resolved source. */
+  metadataProviderExplicit?: boolean;
   /** Internal sync reuse: retain opt-in literal policy and existing credential ownership. */
   credentialPolicy?: "sync";
   /** Require a pre-existing provider when the command did not supply an endpoint. */

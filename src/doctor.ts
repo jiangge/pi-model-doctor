@@ -24,6 +24,7 @@ import {
   type SelectionCandidate,
 } from "./json.ts";
 import { ModelsDevClient, ModelsDevError } from "./models-dev.ts";
+import { metadataProvenance as resolveMetadataProvenance } from "./publisher-registry.ts";
 import {
   adapterIdForPiApi,
   capabilityCompat,
@@ -56,6 +57,7 @@ import type {
   ModelsDevModel,
   ModelsDevProvider,
   DoctorMetadata,
+  MetadataProvenance,
   PiApi,
   PiModel,
   PiModelsJson,
@@ -92,6 +94,7 @@ export interface AddProposal {
   catalogSource: "network" | "cache" | "fallback";
   metadataOnly?: boolean;
   metadataProviderId?: string;
+  metadataProvenance?: MetadataProvenance;
   warning?: string;
   dryRun?: boolean;
 }
@@ -105,6 +108,7 @@ export interface SyncProposal {
   baseExisted?: boolean;
   plan: ChangePlan;
   warnings: string[];
+  metadataSources: MetadataProvenance[];
   dryRun?: boolean;
 }
 
@@ -393,7 +397,7 @@ export class ModelDoctor {
       throw new DoctorError(`Provider ${requestedProviderId} is already configured with a different endpoint; use its existing endpoint or choose a different provider id`, "invalid-target");
     }
     const configuredEntry = configuredByExplicitId ?? (requestedProviderId ? undefined : configuredByTarget);
-    const match = catalog ? chooseMatch(catalog, target, requestedModelId, requestedMetadataProvider, Boolean(configuredEntry || looksLikeUrl(target))) : undefined;
+    const match = catalog ? chooseMatch(catalog, target, requestedModelId, requestedMetadataProvider, Boolean(configuredEntry || looksLikeUrl(target)), input.metadataProviderExplicit ?? Boolean(requestedMetadataProvider)) : undefined;
     if (match?.ambiguous || match?.matchedBy.includes("model-ambiguous")) {
       throw ambiguousModelSelectionError(target, requestedModelId, match);
     }
@@ -556,6 +560,12 @@ export class ModelDoctor {
     const normalizeConfiguredEndpoint = provisionalProviderOnly
       && pendingEndpointAutoRepair
       && isAutoEndpointNormalization(inferredEndpoint, endpoint, endpointApi);
+    const selectedProvenance = resolveMetadataProvenance(provider.id, sourceModel.id, {
+      metadataOnly,
+      explicitProvider: input.metadataProviderExplicit ?? Boolean(requestedMetadataProvider),
+      directTarget: Boolean(match?.model && !match.metadataOnly),
+      fallback: catalogSource === "fallback",
+    });
     const generatedModel = toPiModel(provider, sourceModel, {
       endpoint,
       api: channelApi,
@@ -565,6 +575,7 @@ export class ModelDoctor {
       transportOwned,
       now: this.now(),
       sourceName: this.source,
+      metadataProvenance: selectedProvenance,
       capabilitySource: catalogSource === "fallback" ? "fallback" : "models.dev",
       policy,
     });
@@ -612,12 +623,24 @@ export class ModelDoctor {
       proposalConfig = cloneJson(data);
     }
     const normalizedReasoning = resolveReasoning(provider, sourceModel);
-    const normalizedCache = resolveCache(provider, sourceModel, catalogSource === "fallback" ? "fallback" : "models.dev");
+    const normalizedCache = transportOwned
+      ? resolveCache({ id: provider.id, models: {} }, { id: sourceModel.id }, "fallback")
+      : resolveCache(provider, sourceModel, catalogSource === "fallback" ? "fallback" : "models.dev");
     const adapter = metadataOnly || looksLikeUrl(target)
       ? resolveProviderAdapter({ id: isPiApi(channelApi) ? adapterIdForPiApi(channelApi) : provider.id, models: {} }, endpoint, isPiApi(channelApi) ? channelApi : undefined)
       : resolveProviderAdapter(provider, endpoint, channelApi);
-    if (metadataOnly) {
-      warning = [warning, `Third-party channel ${providerId} is not a models.dev provider; using ${provider.id}/${sourceModel.id} as metadata only. Endpoint, protocol, headers, and authentication remain channel-owned.`]
+    if (transportOwned) {
+      const limits = [sourceModel.limit?.context ? undefined : `contextWindow=${DEFAULT_CONTEXT_WINDOW}`, sourceModel.limit?.output ? undefined : `maxTokens=${DEFAULT_MAX_TOKENS}`].filter(Boolean).join(", ");
+      const sourceNotice = selectedProvenance.reason === "official-reference"
+        ? `Using ${provider.id}/${sourceModel.id} official metadata as the default fallback; official reference limits do not verify this channel's limits.`
+        : selectedProvenance.reason === "explicit-provider"
+          ? `Using explicitly selected metadata provider ${provider.id}/${sourceModel.id}; publisher attribution is not implied.`
+          : selectedProvenance.reason === "direct-catalog"
+            ? `Using direct target catalog metadata from ${provider.id}/${sourceModel.id}; reference limits do not verify this channel's limits.`
+            : selectedProvenance.reason === "conservative-defaults"
+            ? `Official metadata source unknown for ${modelId}; using conservative defaults${limits ? ` (${limits})` : ""}, not verified channel limits.`
+            : `Using ${provider.id}/${sourceModel.id} catalog metadata only; official publisher is unverified and reference limits are not verified channel limits.`;
+      warning = [warning, sourceNotice, limits && selectedProvenance.reason !== "conservative-defaults" ? `Missing catalog limits use conservative defaults (${limits}).` : undefined,  `Using ${provider.id}/${sourceModel.id} as metadata only for channel ${providerId}; endpoint, protocol, headers, authentication, pricing, and cache behavior remain channel-owned.`]
         .filter((item): item is string => Boolean(item))
         .join(" ");
     }
@@ -637,7 +660,8 @@ export class ModelDoctor {
       plan,
       catalogSource,
       metadataOnly,
-      metadataProviderId: metadataOnly ? provider.id : undefined,
+      metadataProviderId: metadataOnly && catalogSource !== "fallback" ? provider.id : undefined,
+      metadataProvenance: selectedProvenance,
       warning,
       dryRun: input.dryRun,
     };
@@ -844,13 +868,29 @@ export class ModelDoctor {
     const config = cloneJson(loadedConfig.data);
     const plans: ChangePlan[] = [];
     const resolvedModelIds: string[] = [];
+    const metadataSources: MetadataProvenance[] = [];
     let providerId: string | undefined;
     const configuredTransport = findConfiguredProvider(getProviders(loadedConfig.data), target)?.provider;
     const channelApi = input.api ?? (isPiApi(configuredTransport?.api) ? configuredTransport.api : detectChannelApi(configuredTransport?.baseUrl ?? target));
 
     for (const modelId of modelIds) {
       const matchingCandidates = candidates.filter((candidate) => candidate.id === modelId);
-      if (discovery.source !== "channel" && matchingCandidates.length > 1 && !metadataProvider) {
+      const caseVariantMetadata = catalog && Object.values(catalog.providers).some((provider) => Object.values(provider.models).some((model) => model.id !== modelId && model.id.toLowerCase() === modelId.toLowerCase()));
+      const configuredTarget = findConfiguredProvider(getProviders(config), target);
+      const directMetadata = catalog && !metadataProvider
+        ? ModelsDevClient.findForConfig(catalog, target, configuredTarget?.provider.baseUrl ?? (looksLikeUrl(target) ? target : undefined), modelId)
+        : undefined;
+      const explicitMetadata = catalog && metadataProvider
+        ? ModelsDevClient.findGlobalModel(catalog, modelId, metadataProvider)
+        : undefined;
+      if (metadataProvider && (!explicitMetadata?.model || explicitMetadata.model.id !== modelId || explicitMetadata.ambiguous)) {
+        throw new DoctorError(`No exact models.dev model matched --metadata-provider ${metadataProvider}/${modelId}`, "invalid-target");
+      }
+      const resolvedMetadata = explicitMetadata
+        ?? (directMetadata?.model?.id === modelId && !directMetadata.ambiguous ? directMetadata : undefined)
+        ?? (catalog && !caseVariantMetadata ? ModelsDevClient.findGlobalModel(catalog, modelId) : undefined);
+      const resolvedMetadataProvider = resolvedMetadata?.model?.id === modelId && !resolvedMetadata.ambiguous ? resolvedMetadata.provider.id : undefined;
+      if (discovery.source !== "channel" && matchingCandidates.length > 1 && !resolvedMetadataProvider) {
         throw new DoctorError(
           `Model ${modelId} is ambiguous for ${target}; pass --metadata-provider <models.dev-provider> (candidates: ${formatProviderCandidateList(matchingCandidates.map((candidate) => candidate.providerId))})`,
           "selection-required",
@@ -859,27 +899,24 @@ export class ModelDoctor {
         );
       }
       if (discovery.source !== "channel" && matchingCandidates.length === 0 && catalog) {
-        // Let proposeAdd produce the same explicit-fallback/error semantics as
-        // add, but do not silently fall back when a catalog match exists under
-        // another provider and was not selected. An explicit URL may still
-        // use a conservative fallback when it has no catalog match.
-        const globalMatches = looksLikeUrl(target) ? ModelsDevClient.findGlobalModel(catalog, modelId, metadataProvider) : undefined;
+        // Only an explicit URL or already-configured channel may retain a
+        // conservative unknown-model fallback. A supplied metadata provider
+        // has already been validated above and never silently degrades.
         const canFallback = looksLikeUrl(target) && !metadataProvider;
-        if (!globalMatches && !canFallback && !findConfiguredProvider(getProviders(loadedConfig.data), target)) {
+        if (!resolvedMetadataProvider && !canFallback && !configuredTarget) {
           throw new DoctorError(`No models.dev model matched ${target}/${modelId}`, "invalid-target");
         }
       }
-      const exactMetadataProviders = catalog ? Object.values(catalog.providers).filter((provider) => (!metadataProvider || provider.id === metadataProvider) && Object.values(provider.models).some((model) => model.id === modelId)) : [];
-      const caseVariantMetadata = catalog && Object.values(catalog.providers).some((provider) => Object.values(provider.models).some((model) => model.id !== modelId && model.id.toLowerCase() === modelId.toLowerCase()));
-      const liveMetadataProvider = discovery.source === "channel" && exactMetadataProviders.length === 1 && !caseVariantMetadata ? exactMetadataProviders[0]?.id : undefined;
-      if (discovery.source === "channel" && exactMetadataProviders.length > 1) warnings.push(`Ambiguous metadata for ${redactSensitiveText(modelId)}; using conservative metadata without changing channel identity.`);
+      if (!resolvedMetadataProvider && !metadataProvider) warnings.push(`Official metadata source unknown for ${redactSensitiveText(modelId)}; using conservative defaults: contextWindow ${DEFAULT_CONTEXT_WINDOW}, maxTokens ${DEFAULT_MAX_TOKENS} (not verified channel limits).`);
+      const channelOwnedTarget = discovery.source === "channel" || configuredTarget !== undefined;
       const add = await this.proposeAdd({
         target,
         modelId,
-        channelTransport: discovery.source === "channel",
-        skipMetadata: !catalog || (discovery.source === "channel" ? !liveMetadataProvider : exactMetadataProviders.length === 0),
+        channelTransport: channelOwnedTarget,
+        skipMetadata: !catalog || !resolvedMetadataProvider,
         requireConfiguredProvider: false,
-        metadataProvider: discovery.source === "channel" ? liveMetadataProvider : metadataProvider,
+        metadataProvider: resolvedMetadataProvider,
+        metadataProviderExplicit: input.metadataProvider !== undefined,
         api: discovery.source === "channel" ? channelApi : input.api,
         apiKey: input.apiKey,
         credentialPolicy: "sync",
@@ -924,6 +961,7 @@ export class ModelDoctor {
         conflicts: [...mergePlan.conflicts, ...add.plan.conflicts],
         warnings: [...mergePlan.warnings, ...add.plan.warnings],
       });
+      if (add.metadataProvenance) metadataSources.push(cloneJson(add.metadataProvenance));
       if (add.warning) warnings.push(add.warning);
       warnings.push(...add.plan.warnings);
     }
@@ -942,6 +980,7 @@ export class ModelDoctor {
       baseExisted: loadedConfig.existed,
       plan,
       warnings: [...new Set(warnings)],
+      metadataSources,
       dryRun: input.dryRun,
     };
   }
@@ -1215,6 +1254,8 @@ export class ModelDoctor {
     const match = findConfiguredMatch(catalog, providerId, provider.baseUrl, model);
     if (!match?.model) {
       findings.push(finding(match?.ambiguous ? "model-selection-required" : "missing-model", "warning", target, match?.ambiguous ? `Model metadata selection for ${target} is ambiguous` : `No models.dev metadata found for ${target}`, false));
+      const provenance = model._piModelDoctor?.metadataProvenance;
+      if (provenance) findings.push(finding("third-party-channel", "info", target, `Persisted metadata provenance: ${provenance.providerId}/${provenance.modelId} (${provenance.reason}); ${provenance.reason === "conservative-defaults" ? `conservative context/output defaults are in use (${DEFAULT_CONTEXT_WINDOW}/${DEFAULT_MAX_TOKENS})` : "source limits are not verified channel limits"}`, false));
       findings.push(...checkLocalModel(providerId, provider, model, policy));
       if (canCorrectLegacyFallbackCache(model)) {
         findings.push(finding("metadata-stale", "warning", target, "Generated fallback cache evidence is stale; unknown cache support must not be represented as a denial or pricing evidence", true));
@@ -1480,7 +1521,7 @@ function mergeModel(providerId: string, existing: PiModel, desired: PiModel, cha
   }
   if (managedFields.length > 0 || removedFields.size > 0 || hasDoctorMetadata(existing)) {
     const previous = hasDoctorMetadata(existing) ? cloneJson(existing._piModelDoctor) : undefined;
-    let next = buildMetadata(previous, { source: "models.dev", lastCheck: now.toISOString(), autoRepair: true, providerId, modelId: existing.id }, managedFields, Object.fromEntries(managedFields.map((field) => [field, existing[field]])));
+    let next = buildMetadata(previous, { source: "models.dev", lastCheck: now.toISOString(), autoRepair: true, providerId, modelId: existing.id, metadataProvenance: desired._piModelDoctor?.metadataProvenance }, managedFields, Object.fromEntries(managedFields.map((field) => [field, existing[field]])));
     for (const field of removedFields) {
       next.managedFields = (next.managedFields ?? []).filter((managedField) => managedField !== field);
       if (next.managedValues) delete next.managedValues[field];
@@ -1676,6 +1717,10 @@ function applyRepairPlan(config: PiModelsJson, target: string, catalog: ModelsDe
     transportOwned,
     now,
     sourceName: source,
+    metadataProvenance: model._piModelDoctor?.metadataProvenance?.providerId === match.provider.id
+      && model._piModelDoctor.metadataProvenance.modelId === match.model?.id
+      ? model._piModelDoctor.metadataProvenance
+      : undefined,
     policy,
   });
   const changes: Change[] = [];
@@ -1789,6 +1834,7 @@ function applyRepairPlan(config: PiModelsJson, target: string, catalog: ModelsDe
   for (const field of removedModelFields) managedFields.delete(field);
   if (transportOwned) managedFields.delete("api");
   const metadataNeedsUpdate = findings.some((item) => item.code === "metadata-missing" || item.code === "metadata-stale" || item.code === "metadata-version")
+    || !jsonEqual(modelMetadataBefore?.metadataProvenance, desired._piModelDoctor?.metadataProvenance)
     || (modelMetadataBefore !== undefined && (
       modelMetadataBefore.version !== MODEL_DOCTOR_VERSION || modelMetadataBefore.source !== source
     ))
@@ -1801,6 +1847,7 @@ function applyRepairPlan(config: PiModelsJson, target: string, catalog: ModelsDe
       autoRepair: true,
       providerId,
       modelId: selected.modelId,
+      metadataProvenance: desired._piModelDoctor?.metadataProvenance,
     }, [...managedFields], managedSnapshotValues(model, managedFields, modelMetadataBefore, modelChangedFields));
     for (const field of removedModelFields) {
       nextMetadata.managedFields = (nextMetadata.managedFields ?? []).filter((managedField) => managedField !== field);
@@ -1866,6 +1913,10 @@ function checkModel(providerId: string, provider: PiProvider, model: PiModel, so
     adapterProviderId: transportOwned ? adapterIdForPiApi(expectedApi) : undefined,
     metadataOnly,
     transportOwned,
+    metadataProvenance: model._piModelDoctor?.metadataProvenance?.providerId === sourceProvider.id
+      && model._piModelDoctor.metadataProvenance.modelId === sourceModel?.id
+      ? model._piModelDoctor.metadataProvenance
+      : undefined,
     policy,
   });
   const transportApiMismatch = transportOwned
@@ -1880,7 +1931,15 @@ function checkModel(providerId: string, provider: PiProvider, model: PiModel, so
     const repairable = canManageField(provider, "baseUrl");
     findings.push(finding("endpoint-mismatch", "warning", target, `Configured endpoint is ${provider.baseUrl ?? "unset"}; models.dev expects ${expectedEndpoint}`, repairable, !repairable));
   } else if (metadataOnly) {
-    findings.push(finding("third-party-channel", "info", target, `Using ${sourceProvider.id}/${sourceModel.id} from models.dev as model metadata only; the configured channel endpoint, protocol, headers, and authentication are authoritative`, false));
+    const provenance = model._piModelDoctor?.metadataProvenance;
+    const sourceLabel = provenance?.reason === "official-reference"
+      ? "default official-reference fallback"
+      : provenance?.reason === "explicit-provider"
+        ? "explicit metadata-provider selection"
+        : provenance?.reason === "conservative-defaults"
+          ? "conservative defaults; official source unknown"
+          : "catalog metadata; publisher unverified";
+    findings.push(finding("third-party-channel", "info", target, `Using ${sourceProvider.id}/${sourceModel.id} (${sourceLabel}); channel endpoint, protocol, headers, and authentication remain authoritative and source limits are not verified channel limits`, false));
   }
   if (pendingEndpointChanged) {
     findings.push(finding("endpoint-mismatch", "warning", target, "Provider-only endpoint was changed after setup; the user-owned endpoint was preserved", false, true));
@@ -2112,7 +2171,21 @@ function ambiguousMatchResult(matches: ProviderMatch[]): ProviderMatch {
   };
 }
 
-function chooseMatch(catalog: ModelsDevCatalog, target: string, modelId?: string, metadataProvider?: string, allowGlobalMetadata = false): ProviderMatch | undefined {
+function chooseMatch(catalog: ModelsDevCatalog, target: string, modelId?: string, metadataProvider?: string, allowGlobalMetadata = false, metadataProviderExplicit = Boolean(metadataProvider)): ProviderMatch | undefined {
+  if (metadataProvider && metadataProviderExplicit && modelId) {
+    const targetMatches = ModelsDevClient.match(catalog, target, modelId, { allowPartialProvider: false, allowPartialModel: false })
+      .filter((match) => match.model?.id === modelId);
+    const selectedTargetMatches = filterMatchesByMetadataProvider(targetMatches, metadataProvider);
+    if (selectedTargetMatches.length === 1 && !selectedTargetMatches[0]?.ambiguous) {
+      return { ...selectedTargetMatches[0], matchedBy: [...selectedTargetMatches[0].matchedBy, "metadata-provider"] };
+    }
+    if (selectedTargetMatches.length > 1) return ambiguousMatchResult(selectedTargetMatches);
+    const explicit = ModelsDevClient.findGlobalModel(catalog, modelId, metadataProvider);
+    if (explicit?.model?.id === modelId && !explicit.ambiguous) {
+      return { ...explicit, matchedBy: [...explicit.matchedBy, "metadata-provider"] };
+    }
+    return explicit;
+  }
   const providerMatches = ModelsDevClient.match(catalog, target, undefined, { allowPartialProvider: false });
   const providerMatch = providerMatches.find((match) => match.matchedBy.some((value) => value === "provider-id-or-name" || value === "api-url"));
   if (providerMatch && modelId) {
@@ -2161,6 +2234,7 @@ function findConfiguredMatch(
   // a provider id such as `openai` or `google`: direct provider lookup would
   // otherwise silently treat the channel as the official catalog provider.
   const metadataOnly = model.compat?.metadataOnly === true;
+  if (model._piModelDoctor?.metadataProvenance?.reason === "conservative-defaults") return undefined;
   const metadataProvider = typeof model.compat?.metadataProviderId === "string"
     ? model.compat.metadataProviderId
     : undefined;
