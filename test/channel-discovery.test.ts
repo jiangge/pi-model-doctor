@@ -221,6 +221,42 @@ test("missing configured protocol infers Anthropic and official URL sync keeps t
   assert.equal(provider?.apiKey, "$CHANNEL_TOKEN");
 });
 
+test("sync preserves resolved metadata when channel ID collides with a catalog provider", async () => {
+  const { paths } = await fixture();
+  const cost = { input: 7, output: 9, cacheRead: 0, cacheWrite: 0 };
+  const channel = {
+    baseUrl: "https://gateway.example/v1", api: "openai-completions",
+    apiKey: "$CHANNEL_TOKEN", headers: { "x-channel": "custom" },
+    models: [{ id: "glm-5.3", cost }],
+  };
+  const before = JSON.stringify({ providers: { openai: channel } });
+  await writeFile(paths.modelsPath, before);
+  const catalog = {
+    openai: { id: "openai", api: "https://api.openai.com/v1", models: { other: { id: "other" } } },
+    zai: { id: "zai", models: { "glm-5.3": { id: "glm-5.3", limit: { context: 200000, output: 32000 } } } },
+  };
+  const doctor = new ModelDoctor({ paths,
+    channelFetch: async () => Response.json({ data: [{ id: "glm-5.3" }] }),
+    fetcher: { fetchImpl: async () => Response.json(catalog) },
+  });
+  for (const explicit of [false, true]) {
+    const proposal = await doctor.proposeSync({ target: "openai", modelIds: ["glm-5.3"],
+      ...(explicit ? { metadataProvider: "zai" } : {}), dryRun: true, persistCache: false });
+    const provider = proposal.config.providers?.openai;
+    const model = provider?.models?.[0];
+    assert.equal(model?.contextWindow, 200000);
+    assert.equal(model?.maxTokens, 32000);
+    assert.equal(model?._piModelDoctor?.metadataProvenance?.providerId, "zai");
+    assert.equal(model?._piModelDoctor?.metadataProvenance?.reason, explicit ? "explicit-provider" : "official-reference");
+    assert.equal(provider?.baseUrl, channel.baseUrl);
+    assert.equal(provider?.api, channel.api);
+    assert.equal(provider?.apiKey, channel.apiKey);
+    assert.deepEqual(provider?.headers, channel.headers);
+    assert.deepEqual(model?.cost, cost);
+  }
+  assert.equal(await readFile(paths.modelsPath, "utf8"), before);
+});
+
 test("live IDs override catalog ambiguity/case variants and catalog fallback stays labelled", async () => {
   const { paths } = await fixture();
   const catalog = { a: { id: "a", api: "https://a.example/v1", models: { Shared: { id: "Shared" }, shared: { id: "shared" } } }, b: { id: "b", api: "https://b.example/v1", models: { Shared: { id: "Shared" } } } };

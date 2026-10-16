@@ -7,6 +7,7 @@
 - Use `readModelsJson` → proposal/plan → `writeModelsJson`; never mutate the target file in a command parser.
 - Preserve unknown JSON fields and user-owned values. Track managed fields and snapshots in `_piModelDoctor` so later explicit edits become conflicts.
 - Add a behavior test for every new command/persistence rule and rerun both typecheck and tests after fixes.
+- Keep metadata selection separate from provenance: a provider resolved internally by sync must constrain downstream add matching just like a user-selected provider, but must not be reported as user-explicit. Cover configured channel IDs that collide with catalog provider IDs.
 
 ## Forbidden Patterns
 

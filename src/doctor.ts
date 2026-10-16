@@ -397,7 +397,7 @@ export class ModelDoctor {
       throw new DoctorError(`Provider ${requestedProviderId} is already configured with a different endpoint; use its existing endpoint or choose a different provider id`, "invalid-target");
     }
     const configuredEntry = configuredByExplicitId ?? (requestedProviderId ? undefined : configuredByTarget);
-    const match = catalog ? chooseMatch(catalog, target, requestedModelId, requestedMetadataProvider, Boolean(configuredEntry || looksLikeUrl(target)), input.metadataProviderExplicit ?? Boolean(requestedMetadataProvider)) : undefined;
+    const match = catalog ? chooseMatch(catalog, target, requestedModelId, requestedMetadataProvider, Boolean(configuredEntry || looksLikeUrl(target))) : undefined;
     if (match?.ambiguous || match?.matchedBy.includes("model-ambiguous")) {
       throw ambiguousModelSelectionError(target, requestedModelId, match);
     }
@@ -2171,8 +2171,10 @@ function ambiguousMatchResult(matches: ProviderMatch[]): ProviderMatch {
   };
 }
 
-function chooseMatch(catalog: ModelsDevCatalog, target: string, modelId?: string, metadataProvider?: string, allowGlobalMetadata = false, metadataProviderExplicit = Boolean(metadataProvider)): ProviderMatch | undefined {
-  if (metadataProvider && metadataProviderExplicit && modelId) {
+function chooseMatch(catalog: ModelsDevCatalog, target: string, modelId?: string, metadataProvider?: string, allowGlobalMetadata = false): ProviderMatch | undefined {
+  // A source resolved by sync is just as authoritative for selection as a
+  // user-selected source. Explicitness affects provenance, not matching.
+  if (metadataProvider && modelId) {
     const targetMatches = ModelsDevClient.match(catalog, target, modelId, { allowPartialProvider: false, allowPartialModel: false })
       .filter((match) => match.model?.id === modelId);
     const selectedTargetMatches = filterMatchesByMetadataProvider(targetMatches, metadataProvider);
