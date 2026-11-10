@@ -9,13 +9,18 @@
 - Add a behavior test for every new command/persistence rule and rerun both typecheck and tests after fixes.
 - Keep metadata selection separate from provenance: a provider resolved internally by sync must constrain downstream add matching just like a user-selected provider, but must not be reported as user-explicit. Cover configured channel IDs that collide with catalog provider IDs.
 
+- For bulk sync, select first, then propose/apply once. `--all` requires live advertisement; empty success is a no-op, never catalog admission. Keep authorization before headless discovery and dry-run fully non-persisting.
+- Separate channel runtime ID from exact source ID; finish full-ID source tiers before slash suffixes, preserve explicit provider scope, and treat unresolved ambiguity as terminal. Check/fix must validate recorded suffix provenance rather than rename models or hide arbitrary ID mismatches.
+- Keep result reporting at the command boundary with explicit per-invocation outcomes and the supported injected sink; never parse human text for status. Follow [Model Doctor Contract §3–7](./model-doctor-contract.md) for result schema, limits, examples and assertion points.
+
 ## Forbidden Patterns
 
 - `any` in production modules to bypass type safety.
 - Direct writes to `models.json` without a timestamped backup and atomic rename.
 - Network calls as the only source of truth for local `list`, `check`, or `fix`.
 - Hard-coded finite model/provider parameter rules in place of metadata-driven resolvers. Narrow exception: a reviewed, exact-model-ID publisher-attribution registry may select which catalog provider supplies metadata; it must contain no numeric limits or capability values, cite official evidence and verification dates, and leave all model parameters dynamically sourced from the catalog.
-- Logging or displaying credentials.
+- Logging or displaying credentials, dumping raw arguments/errors into result details, ad-hoc stdout under host JSON/RPC, or triggering an LLM turn for deterministic reporting.
+- Per-model apply loops for sync, silent --all fallback imports, fuzzy suffix guesses, or conflating internal source selection with explicit user intent.
 - Overwriting `headers`, endpoint overrides, temperature, or arbitrary compatibility fields just because models.dev differs.
 
 ## Test Commands
@@ -34,4 +39,7 @@ Tests use Node's built-in test runner with `tsx`, temporary directories, and moc
 - [ ] Existing custom headers, endpoint overrides, unknown fields, and unrelated providers survive.
 - [ ] Metadata is versioned, namespaced, and has managed-field snapshots.
 - [ ] Network failures retain valid cache and report staleness.
+- [ ] Bulk tests assert one transaction/backup, empty/fallback/no-op behavior and bounded success/conflict/failure output without truncating persisted IDs.
+- [ ] Prefix tests assert original exact precedence, terminal ambiguity, explicit scope, provenance/ownership and repeat check/fix identity.
+- [ ] Headless tests assert safe final result fields/status, no model work or TUI/RPC duplicates, and installed-host JSON/print behavior with isolated temporary resources and deadlines.
 - [ ] Typecheck, tests, and `git diff --check` pass.

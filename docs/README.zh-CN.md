@@ -86,17 +86,49 @@ Pi 会以项目的 `.pi/` 目录作为 `.pi/settings.json` 相对路径的基准
 /model-doctor fix [provider/model] [--dry-run] [--yes]
 /model-doctor remove <provider/model> [--dry-run] [--yes]
 /model-doctor refresh [--force] [--dry-run]
-/model-doctor sync <provider-or-url> [--models <id1,id2>] [--metadata-provider <models.dev-provider>] [--api <protocol>] [--api-key <reference>] [--allow-literal-api-key] [--dry-run] [--yes]
+/model-doctor sync <provider-or-url> [--models <id1,id2> | --all] [--metadata-provider <models.dev-provider>] [--api <protocol>] [--api-key <reference>] [--allow-literal-api-key] [--dry-run] [--yes]
 /model-doctor migrate <provider/model> [--to <provider/model>] [--dry-run] [--yes] [--remove-source]
 /model-doctor cleanup-backups [--keep <count>] [--max-age-ms <milliseconds>] [--dry-run] [--yes]
 /model-doctor rollback <models.json.bak-timestamp> [--dry-run] [--yes]
 ```
 
-`sync` 会在 dry-run、写入及无变更通知中逐模型报告 metadata 来源。channel discovery 失败后仍按精确模型 id 解析官方 publisher 来源；无效的显式 `--metadata-provider` 会报错，绝不会静默改用 publisher 或保守默认值。它从 models.dev 发现 provider/channel 的全部模型，交互式 UI 通过分页、可搜索的多选器选择多个模型：逐个勾选/反选模型，对搜索结果一键全选或反选、清空选择，以及翻页浏览大列表（每页 10 个），最后选择 Done。操作项（全选/反选/清空、搜索、翻页、Done）排在模型列表之前，在没有列表滚动的终端上也能始终可见。任何选择步骤取消都会以 `not-persisted` 结束，不创建 proposal，也不写入配置。非交互模式必须通过 `--models model-a,model-b` 显式指定；不会隐式选择 catalog 首项或全部模型。sync 是一次组合 proposal：一次确认、一次备份、一次原子写入，所有选中模型一起应用。`sync --dry-run` 不写入 models.json、备份或缓存。交互式 `add` 模型选择器和 `migrate` 目标选择器同样使用分页、可搜索的模式。
+`sync` 会在 dry-run、写入及无变更通知中逐模型报告 metadata 来源。channel discovery 失败后仍按精确模型 id 解析官方 publisher 来源；无效的显式 `--metadata-provider` 会报错，绝不会静默改用 publisher 或保守默认值。它从 models.dev 发现 provider/channel 的全部模型，交互式 UI 通过分页、可搜索的多选器选择多个模型：逐个勾选/反选模型，对搜索结果一键全选或反选、清空选择，以及翻页浏览大列表（每页 10 个），最后选择 Done。操作项（全选/反选/清空、搜索、翻页、Done）排在模型列表之前，在没有列表滚动的终端上也能始终可见。任何选择步骤取消都会以 `not-persisted` 结束，不创建 proposal，也不写入配置。非交互模式必须通过 `--models model-a,model-b` 或 `--all` 显式指定；不会隐式选择 catalog 首项或全部模型。`sync sample-channel --all --dry-run` 预览成功的实时渠道列表中的全部精确 ID，`sync sample-channel --all --yes` 则应用。`--all` 跳过交互选择器，不能与 `--models` 同用，且必须成功获取实时渠道列表；不会静默选择 catalog/本地回退列表。成功返回空列表时报告零模型，不创建 proposal、备份或写入。大型预览会对模型、来源、变更、冲突及警告展示有限样例、总数和省略数量；实际应用的模型列表不会截断，所有权冲突仍保留用户字段。sync 是一次组合 proposal：一次确认、一次备份、一次原子写入，所有选中模型一起应用。`sync --dry-run` 不写入 models.json、备份或缓存。交互式 `add` 模型选择器和 `migrate` 目标选择器同样使用分页、可搜索的模式。
+
+sync 的 metadata 查找会先按现有来源优先级尝试完整渠道 ID，再逐段移除开头的斜杠前缀（`a/b/c` → `b/c` → `c`）。每个后缀保持相同来源优先级，`--metadata-provider` 始终限定来源。歧义会停止剥离，不会跳到更短且恰好唯一的匹配：无法消歧的渠道 metadata 保留保守默认行为，catalog 并列保留选择错误；显式来源缺失或歧义会失败。无匹配时明确标注保守默认值。运行时 ID 始终保留 `a/b/c`。剥离匹配记录 `matchKind: "prefix-stripped"`、`requestedModelId`、实际来源 provider/model 及原有来源原因，预览展示该映射。后续 check/fix 使用记录的来源，不重命名渠道模型，也不覆盖用户自有字段。
 
 `add` 始终以 provider id 开始：`add <provider-id> [endpoint-url] [model]`。第二个位置参数只有在它是 HTTP(S) URL 时才会被视为 endpoint，否则视为 model id；不再支持 URL-first 语法。如果省略 endpoint，provider 必须已经存在于 `models.json`，因此现有 endpoint、API 协议、headers、认证和其他传输字段保持不变。交互式 UI 中省略模型时会通过分页、可搜索的候选选择器展示候选列表；非交互模式必须提供显式 model id。新渠道可以用 `add providerA https://gateway.example/v1 <model>` 创建，也可以先用 `add providerA https://gateway.example/v1` 建立 provider-only，再用 `add providerA <model>` 或 `sync providerA` 添加模型。未在 models.dev 登记的第三方渠道可以使用精确匹配的 models.dev 模型作为 metadata-only。metadata 来源优先级为显式 `--metadata-provider`、目标 provider 的直接 metadata、经官方资料核实的精确 publisher 归属，最后才是唯一但未证实发布者的 catalog 来源。publisher 注册表只负责选择 metadata 来源，不硬编码模型参数；context/output 等参数仍动态读取 catalog。目前仅将精确模型 id `glm-5.3` 根据 [Z.AI 官方模型文档](https://docs.z.ai/guides/llm/glm-5.3) 和 [API 文档](https://docs.z.ai/api-reference/introduction) 映射到 Z.AI；SDK 包名不能证明模型作者。dry-run、写入和无变更通知都会报告每个模型的来源、原因及持久化状态。官方 limits 只是参考，不代表该渠道已验证的运行上限；不会将官方价格/cache 执行能力或 endpoint、API、headers、认证当作渠道事实。无法确认官方来源时会明确标注 catalog-only 或保守默认值，并指出缺失的 context/output 使用了 Pi 保守默认值。模型 id 在多个 models.dev provider 间有歧义时，交互模式会通过分页选择器列出并列的 metadata provider 供选择（等价于显式传 `--metadata-provider`），报错信息也会列出候选 provider id 便于 `--metadata-provider <models.dev-provider>` 消歧。`configure providerA [endpoint-url] [model]` 可修改已有 provider 的 endpoint、API 协议和/或 API-key 引用；省略 model 时还会同步 Model Doctor 管理的模型 API，同时保留用户自有模型的 API。省略 `--api` 时，协议推断依次参考现有配置、catalog/provider metadata、endpoint，最后才使用弱模型名提示；无法判断时默认 `openai-completions`。支持的 API 值为 `openai-completions`、`mistral-conversations`、`openai-responses`、`azure-openai-responses`、`openai-codex-responses`、`anthropic-messages`、`bedrock-converse-stream`、`google-generative-ai`、`google-vertex` 和 `pi-messages`。一步添加渠道模型时，根 URL 仅在 `openai-completions` 或 `openai-responses` 下补全 `/v1`；已有路径、查询参数和 fragment 保持不变；provider-only 不补全 `/v1`。Provider 官网数据不会自动抓取。API 凭据应使用 `$OPENAI_API_KEY`、`${OPENAI_API_KEY}`、`!command` 或 `pi-auth:provider` 等引用；`add --api-key` 本身即授权保存明文，并替换 provider 已有 key；省略时保留旧值，引用原样保存，不执行或展开。`--allow-literal-api-key` 继续兼容，但 add 不再需要它；configure 和 sync 保存明文仍需该 opt-in。扩展不会打印 secret。使用 `--dry-run` 可预览而不写入；非交互写入需要 `--yes`，且 dry-run 优先级更高。`migrate` 接受显式 `--to provider/model`，UI 模式可展示目标候选；非交互模式必须提供 `--to`。
 
 `check` 可离线检查本地文件，网络不可用时使用本地 models.dev 缓存；即使没有 catalog 也会报告本地所有权、元数据和 header findings。slash-command `refresh` 强制读取 catalog 并报告完整配置 findings，不应用修复；它从不写入 `models.json`，普通形式可以更新 catalog/policy 缓存。`refresh --dry-run` 完全只读，也不修改 catalog/policy 缓存。`fix` 只修改 Pi Model Doctor 拥有的字段。如果用户显式修改过 endpoint、header、compat 对象或模型能力，会报告为 conflict 且不会覆盖。`remove` 需要精确的 `provider/model` 目标。`migrate` 从当前元数据创建目标模型，保留安全用户字段，报告 endpoint/API/header 冲突但不复制 secret，默认保留源模型，显式 `--remove-source` 才会删除源；deprecated 目标仅作提示，不能自动应用。无操作的迁移报告无变更且不创建备份。每次修改都会验证 proposal 创建后 `models.json` 是否变化，然后使用备份、原子写入、持久化后 read-back 验证；持久化验证失败会自动恢复。当活动 Pi runtime 使用默认 agent models 路径时，命令会刷新并验证模型注册表，报告 `persisted-and-active`、`activation-failed` 或 `persisted-reload-required`；dry-run 和取消报告 `not-persisted`。备份清理是显式操作：`/model-doctor cleanup-backups --keep <count>` 或 `--max-age-ms <milliseconds>` 在授权后预览/删除旧的时间戳备份；从不自动运行。
+
+## 无界面结果（JSON 模式）
+
+Pi print 模式**会执行**已注册的扩展命令，但 print/JSON 模式不显示通知。`pi -p '/model-doctor ...'` 因而不保证有可见输出。自动化请使用全新的 JSON 会话：
+
+```sh
+pi --mode json --no-session -e ./index.ts '/model-doctor sync sample-channel --all --dry-run'
+# 审阅后将 --dry-run 换成 --yes 才会应用。
+```
+
+`-e ./index.ts` 用于开发检出；已在 Pi 中安装包时省略。无界面 sync 需要显式 `--models` 或 `--all`，写入需要 `--yes`；dry-run 不写入。
+
+当 `!ctx.hasUI` 时，doctor 通过受支持的 `pi.sendMessage(..., { triggerTurn: false })` 每条命令发送一个最终 custom 消息，不启动模型调用。解析 JSONL 时匹配 `type === "message_end"`、`message.role === "custom"`、`message.customType === "model-doctor-result"`：
+
+```sh
+pi --mode json --no-session -e ./index.ts '/model-doctor help' |
+  jq -c 'select(.type == "message_end" and .message.role == "custom" and .message.customType == "model-doctor-result") | .message.details'
+```
+
+`message.content` 是脱敏且不超过 12,000 字符的人类可读文本，不应作为机器状态格式解析。`message.details` 仅含 `command`（已知子命令或 `invalid`）、`final: true`、`severity`（`info`/`warning`/`error`）、布尔 `success` 和 `status`：
+
+- `completed`：只读/help 完成，check 的发现仍是建议性诊断。
+- `dry-run`：预览完成，未持久化。
+- `no-op`：无需写入或备份，也包括渠道返回空列表。
+- `persisted`、`persisted-and-active`、`persisted-reload-required`：已持久化，最后一种需要重载 Pi 才能激活。
+- `failed`、`blocked`、`activation-failed`：`success: false`。激活失败表示文件**已经持久化**，但运行时激活失败；解析、验证、授权及操作错误均报告 `failed`。
+
+请设置自己的超时并要求收到最终记录，检查 `details.success`/`status`。**宿主退出码不代表 doctor 操作成功**：命令被处理后，即使操作失败也可能退出零。不要只过滤 assistant 消息，也不要等待 `agent_settled`，因为 slash 命令不一定启动 agent run。discovery 通知只是进度，不是额外的最终结果。custom 消息不是 assistant 文本，因此纯文本 print 即使成功也可能无输出。doctor 不向 stdout 写入临时协议外文本，也不会调用 LLM 来展示结果。
+
+另一个可行方案是 RPC：用 `prompt` 发送 slash 命令，消费 `method: "notify"` 的 `extension_ui_request`。RPC 的 `hasUI: true`，保留现有通知而不重复发送 custom 结果。prompt 响应中的 `success: true`/`disposition: "handled"` 仅代表分发成功；必须检查 doctor 通知及最终持久化状态。显式选择模型并提供 `--yes` 可避免 RPC 对话框。交互式 TUI 通知保持不变。
 
 ## 安全写入与所有权
 

@@ -1,0 +1,7 @@
+{"_example": "Fill with {\"file\": \"<path>\", \"reason\": \"<why>\"}. Put spec/research files only — no code paths. Run `python3 .trellis/scripts/get_context.py --mode packages` to list available specs. Delete this line once real entries are added."}
+{"file": ".trellis/spec/backend/index.md", "reason": "Backend entry guidelines"}
+{"file": ".trellis/spec/backend/model-doctor-contract.md", "reason": "Sync contracts and regression requirements"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Sync contracts and regression requirements"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "Sync contracts and regression requirements"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "Sync contracts and regression requirements"}
+{"file": ".trellis/tasks/11-10-sync-gateway-improvements/research/sync-design.md", "reason": "Verified host behavior and sync implementation design"}

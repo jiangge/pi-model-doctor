@@ -26,6 +26,9 @@ export interface MetadataProvenance {
   reason: MetadataProvenanceReason;
   evidence: string[];
   verifiedAt?: string;
+  /** Original channel identity when metadata used a slash-delimited suffix. */
+  requestedModelId?: string;
+  matchKind?: "prefix-stripped";
 }
 
 export interface DoctorMetadata {
@@ -503,6 +506,8 @@ export interface AddInput {
   metadataProvider?: string;
   /** Internal sync marker: distinguishes user selection from resolved source. */
   metadataProviderExplicit?: boolean;
+  /** Internal sync source identity; runtime identity remains modelId. */
+  metadataModelId?: string;
   /** Internal sync reuse: retain opt-in literal policy and existing credential ownership. */
   credentialPolicy?: "sync";
   /** Require a pre-existing provider when the command did not supply an endpoint. */

@@ -356,6 +356,10 @@ export class ModelDoctor {
     if (looksLikeUrl(target)) validateExplicitProviderUrl(target);
     const requestedModelId = input.modelId?.trim();
     if (input.modelId !== undefined && (!requestedModelId || isUnsafeIdentifier(requestedModelId))) throw new DoctorError("Model id must be a safe non-empty identifier", "invalid-target");
+    if (input.metadataModelId !== undefined && (!requestedModelId || !input.metadataProvider
+      || !metadataLookupIds(requestedModelId).includes(input.metadataModelId))) {
+      throw new DoctorError("Sync metadata identity must be an exact channel ID or slash-delimited suffix with a source provider", "invalid-target");
+    }
     const requestedProviderId = input.providerId?.trim();
     if (input.providerId !== undefined && (!requestedProviderId || isUnsafeIdentifier(requestedProviderId) || /[\\/]/.test(requestedProviderId))) {
       throw new DoctorError("Explicit provider id must be a safe non-empty identifier", "invalid-target");
@@ -397,9 +401,12 @@ export class ModelDoctor {
       throw new DoctorError(`Provider ${requestedProviderId} is already configured with a different endpoint; use its existing endpoint or choose a different provider id`, "invalid-target");
     }
     const configuredEntry = configuredByExplicitId ?? (requestedProviderId ? undefined : configuredByTarget);
-    const match = catalog ? chooseMatch(catalog, target, requestedModelId, requestedMetadataProvider, Boolean(configuredEntry || looksLikeUrl(target))) : undefined;
+    const match = catalog ? chooseMatch(catalog, target, input.metadataModelId ?? requestedModelId, requestedMetadataProvider, Boolean(configuredEntry || looksLikeUrl(target))) : undefined;
     if (match?.ambiguous || match?.matchedBy.includes("model-ambiguous")) {
       throw ambiguousModelSelectionError(target, requestedModelId, match);
+    }
+    if (input.metadataModelId !== undefined && match?.model?.id !== input.metadataModelId) {
+      throw new DoctorError("Sync metadata source changed; generate a new proposal", "invalid-target");
     }
     const credentialOnly = !requestedModelId && Boolean(configuredEntry) && input.apiKey !== undefined && explicitAddAuth;
     if (!requestedModelId && !looksLikeUrl(target) && !credentialOnly) {
@@ -510,7 +517,7 @@ export class ModelDoctor {
       metadataOnly,
       catalog ? Object.keys(catalog.providers) : [],
     );
-    const modelId = sourceModel.id;
+    const modelId = input.metadataModelId && requestedModelId ? requestedModelId : sourceModel.id;
     const requestedEndpoint = looksLikeUrl(target)
       ? target
       : (provisionalProviderOnly || metadataOnly)
@@ -560,12 +567,16 @@ export class ModelDoctor {
     const normalizeConfiguredEndpoint = provisionalProviderOnly
       && pendingEndpointAutoRepair
       && isAutoEndpointNormalization(inferredEndpoint, endpoint, endpointApi);
-    const selectedProvenance = resolveMetadataProvenance(provider.id, sourceModel.id, {
+    const selectedProvenance: MetadataProvenance = resolveMetadataProvenance(provider.id, sourceModel.id, {
       metadataOnly,
       explicitProvider: input.metadataProviderExplicit ?? Boolean(requestedMetadataProvider),
       directTarget: Boolean(match?.model && !match.metadataOnly),
       fallback: catalogSource === "fallback",
     });
+    if (input.metadataModelId && requestedModelId !== sourceModel.id) {
+      selectedProvenance.requestedModelId = requestedModelId;
+      selectedProvenance.matchKind = "prefix-stripped";
+    }
     const generatedModel = toPiModel(provider, sourceModel, {
       endpoint,
       api: channelApi,
@@ -579,6 +590,7 @@ export class ModelDoctor {
       capabilitySource: catalogSource === "fallback" ? "fallback" : "models.dev",
       policy,
     });
+    generatedModel.id = modelId;
     const requestedApiKey = input.apiKey?.trim();
     if (input.apiKey !== undefined && !requestedApiKey) throw new DoctorError("API key reference must not be empty", "invalid-target");
     const apiKeyReference = requestedApiKey && (isCredentialReference(requestedApiKey) || allowLiteralApiKey)
@@ -875,21 +887,13 @@ export class ModelDoctor {
 
     for (const modelId of modelIds) {
       const matchingCandidates = candidates.filter((candidate) => candidate.id === modelId);
-      const caseVariantMetadata = catalog && Object.values(catalog.providers).some((provider) => Object.values(provider.models).some((model) => model.id !== modelId && model.id.toLowerCase() === modelId.toLowerCase()));
       const configuredTarget = findConfiguredProvider(getProviders(config), target);
-      const directMetadata = catalog && !metadataProvider
-        ? ModelsDevClient.findForConfig(catalog, target, configuredTarget?.provider.baseUrl ?? (looksLikeUrl(target) ? target : undefined), modelId)
-        : undefined;
-      const explicitMetadata = catalog && metadataProvider
-        ? ModelsDevClient.findGlobalModel(catalog, modelId, metadataProvider)
-        : undefined;
-      if (metadataProvider && (!explicitMetadata?.model || explicitMetadata.model.id !== modelId || explicitMetadata.ambiguous)) {
+      const resolvedMetadata = catalog ? resolveSyncMetadata(catalog, target,
+        configuredTarget?.provider.baseUrl ?? (looksLikeUrl(target) ? target : undefined), modelId, metadataProvider) : undefined;
+      if (metadataProvider && !resolvedMetadata?.model) {
         throw new DoctorError(`No exact models.dev model matched --metadata-provider ${metadataProvider}/${modelId}`, "invalid-target");
       }
-      const resolvedMetadata = explicitMetadata
-        ?? (directMetadata?.model?.id === modelId && !directMetadata.ambiguous ? directMetadata : undefined)
-        ?? (catalog && !caseVariantMetadata ? ModelsDevClient.findGlobalModel(catalog, modelId) : undefined);
-      const resolvedMetadataProvider = resolvedMetadata?.model?.id === modelId && !resolvedMetadata.ambiguous ? resolvedMetadata.provider.id : undefined;
+      const resolvedMetadataProvider = resolvedMetadata?.model ? resolvedMetadata.provider.id : undefined;
       if (discovery.source !== "channel" && matchingCandidates.length > 1 && !resolvedMetadataProvider) {
         throw new DoctorError(
           `Model ${modelId} is ambiguous for ${target}; pass --metadata-provider <models.dev-provider> (candidates: ${formatProviderCandidateList(matchingCandidates.map((candidate) => candidate.providerId))})`,
@@ -916,6 +920,7 @@ export class ModelDoctor {
         skipMetadata: !catalog || !resolvedMetadataProvider,
         requireConfiguredProvider: false,
         metadataProvider: resolvedMetadataProvider,
+        metadataModelId: resolvedMetadata?.model?.id,
         metadataProviderExplicit: input.metadataProvider !== undefined,
         api: discovery.source === "channel" ? channelApi : input.api,
         apiKey: input.apiKey,
@@ -997,7 +1002,6 @@ export class ModelDoctor {
 
   async check(target?: string): Promise<CheckResult> {
     const { data } = await readModelsJson(this.options.paths.modelsPath);
-    const checkedAt = this.now().toISOString();
     let catalog: ModelsDevCatalog;
     let networkFinding: Finding | undefined;
     try {
@@ -1958,7 +1962,7 @@ function checkModel(providerId: string, provider: PiProvider, model: PiModel, so
     const repairable = canManageField(provider, "name");
     findings.push(finding("metadata-stale", "info", target, `Provider name is ${provider.name ?? "unset"}; models.dev says ${sourceProvider.name}`, repairable, !repairable, "models.dev", "medium"));
   }
-  if (model.id !== sourceModel.id) findings.push(finding("model-id-mismatch", "warning", target, `Configured model id ${model.id} does not match metadata id ${sourceModel.id}`, false, true));
+  if (model.id !== sourceModel.id && !isRecordedStrippedMatch(model, sourceProvider.id, sourceModel.id)) findings.push(finding("model-id-mismatch", "warning", target, `Configured model id ${model.id} does not match metadata id ${sourceModel.id}`, false, true));
   if (sourceModel.name !== undefined && model.name !== sourceModel.name) {
     findings.push(finding("metadata-stale", "info", target, `Model name is ${model.name ?? "unset"}; models.dev says ${sourceModel.name}`, canManageField(model, "name"), !canManageField(model, "name")));
   }
@@ -2171,6 +2175,44 @@ function ambiguousMatchResult(matches: ProviderMatch[]): ProviderMatch {
   };
 }
 
+function metadataLookupIds(id: string): string[] {
+  const ids = [id];
+  while (id.includes("/")) {
+    id = id.slice(id.indexOf("/") + 1);
+    if (id && !ids.includes(id)) ids.push(id);
+  }
+  return ids;
+}
+
+function isRecordedStrippedMatch(model: PiModel, providerId: string, sourceId: string): boolean {
+  const recorded = model._piModelDoctor?.metadataProvenance;
+  return model.compat?.metadataOnly === true && recorded?.matchKind === "prefix-stripped"
+    && recorded.requestedModelId === model.id && recorded.providerId === providerId
+    && recorded.modelId === sourceId && metadataLookupIds(model.id).slice(1).includes(sourceId);
+}
+
+function resolveSyncMetadata(catalog: ModelsDevCatalog, target: string, endpoint: string | undefined, id: string, metadataProvider?: string): ProviderMatch | undefined {
+  for (const lookupId of metadataLookupIds(id)) {
+    const direct = !metadataProvider ? ModelsDevClient.findForConfig(catalog, target, endpoint, lookupId) : undefined;
+    const caseVariant = Object.values(catalog.providers).some((provider) =>
+      (!metadataProvider || provider.id === metadataProvider) && Object.values(provider.models).some((model) => model.id !== lookupId && model.id.toLowerCase() === lookupId.toLowerCase()));
+    const global = metadataProvider || (!caseVariant && (!direct?.model || direct.model.id !== lookupId))
+      ? ModelsDevClient.findGlobalModel(catalog, lookupId, metadataProvider) : undefined;
+    // Ambiguity is terminal, not a reason to try a shorter suffix. Preserve
+    // sync's conservative live-channel fallback (explicit sources are errors).
+    // A direct lookup can tie on display names even when a global exact ID
+    // exists. As before, only an unambiguous direct ID outranks that exact ID.
+    const selected = direct?.model?.id === lookupId && !direct.ambiguous ? direct : global ?? (direct?.ambiguous ? direct : undefined);
+    if (selected?.ambiguous) {
+      if (metadataProvider) throw new DoctorError(`No exact models.dev model matched --metadata-provider ${metadataProvider}/${id}`, "invalid-target");
+      return undefined;
+    }
+    if (selected?.model?.id === lookupId) return selected;
+    if (caseVariant) return undefined;
+  }
+  return undefined;
+}
+
 function chooseMatch(catalog: ModelsDevCatalog, target: string, modelId?: string, metadataProvider?: string, allowGlobalMetadata = false): ProviderMatch | undefined {
   // A source resolved by sync is just as authoritative for selection as a
   // user-selected source. Explicitness affects provenance, not matching.
@@ -2241,6 +2283,12 @@ function findConfiguredMatch(
     ? model.compat.metadataProviderId
     : undefined;
   if (metadataOnly) {
+    const recorded = model._piModelDoctor?.metadataProvenance;
+    if (recorded && isRecordedStrippedMatch(model, recorded.providerId, recorded.modelId)) {
+      const source = ModelsDevClient.findGlobalModel(catalog, recorded.modelId, recorded.providerId);
+      if (source?.model?.id === recorded.modelId) return source;
+      return undefined;
+    }
     const globalById = ModelsDevClient.findGlobalModel(catalog, model.id, metadataProvider);
     if (globalById) return globalById;
     if (model.name && model.name !== model.id) {

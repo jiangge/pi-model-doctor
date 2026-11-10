@@ -11,13 +11,13 @@ export interface ParsedCommand {
   flags: Record<string, string | boolean>;
 }
 
-const BOOLEAN_FLAGS = new Set(["dry-run", "yes", "force", "remove-source", "allow-literal-api-key"]);
+const BOOLEAN_FLAGS = new Set(["dry-run", "yes", "force", "remove-source", "allow-literal-api-key", "all"]);
 const PI_API_FLAG_USAGE = `<${PI_API_OPTIONS.join("|")}>`;
 const PI_API_FLAG_VALUES = PI_API_OPTIONS.join(", ");
 const COMMAND_FLAGS: Record<string, ReadonlySet<string>> = {
   add: new Set(["api-key", "metadata-provider", "api", "dry-run", "yes", "allow-literal-api-key"]),
   configure: new Set(["api-key", "api", "dry-run", "yes", "allow-literal-api-key"]),
-  sync: new Set(["models", "api-key", "metadata-provider", "api", "dry-run", "yes", "allow-literal-api-key"]),
+  sync: new Set(["all", "models", "api-key", "metadata-provider", "api", "dry-run", "yes", "allow-literal-api-key"]),
   list: new Set(),
   check: new Set(),
   fix: new Set(["dry-run", "yes"]),
@@ -98,19 +98,52 @@ export function formatCandidates(candidates: ModelCandidate[]): string {
 export function registerModelDoctorCommand(pi: ExtensionAPI, doctor: ModelDoctor): void {
   pi.registerCommand("model-doctor", {
     description: "Discover, sync, configure APIs, check, fix, migrate, and manage Pi models.json",
-    getArgumentCompletions: (prefix) => {
+    getArgumentCompletions: (prefix: string) => {
       const values = ["add", "configure", "list", "check", "fix", "remove", "refresh", "sync", "migrate", "cleanup-backups", "rollback", "help"];
       return values.filter((value) => value.startsWith(prefix)).map((value) => ({ value, label: value }));
     },
-    handler: async (rawArgs, ctx) => {
-      await runCommand(rawArgs, ctx, doctor);
+    handler: async (rawArgs: string, ctx: ExtensionCommandContext) => {
+      await runCommand(rawArgs, ctx, doctor, (result) => {
+        pi.sendMessage({ customType: "model-doctor-result", content: result.content, display: true, details: result.details }, { triggerTurn: false });
+      });
     },
   });
 }
 
-export async function runCommand(rawArgs: string, ctx: ExtensionCommandContext, doctor: ModelDoctor): Promise<void> {
-  const parsed = parseCommandArgs(rawArgs);
+export interface CommandResult {
+  content: string;
+  details: {
+    command: ParsedCommand["command"];
+    success: boolean;
+    status: string;
+    severity: "info" | "warning" | "error";
+    final: true;
+  };
+}
+
+export type CommandResultSink = (result: CommandResult) => void;
+
+// Per-invocation state; never share an outcome between concurrent commands.
+const commandOutcomes = new WeakMap<ExtensionCommandContext, string>();
+function recordOutcome(ctx: ExtensionCommandContext, status: string): void {
+  commandOutcomes.set(ctx, status);
+}
+
+export async function runCommand(rawArgs: string, originalCtx: ExtensionCommandContext, doctor: ModelDoctor, sink?: CommandResultSink): Promise<void> {
+  let parsed: ParsedCommand = { command: "invalid", args: [], flags: {} };
+  let last: { message: string; severity: "info" | "warning" | "error" } | undefined;
+  // Keep the host UI intact. Capture only this invocation's last notification;
+  // discovery is progress, never a final result (a later result/error replaces it).
+  const ctx = Object.create(originalCtx) as ExtensionCommandContext;
+  const ui = Object.create(originalCtx.ui) as ExtensionCommandContext["ui"];
+  Object.defineProperty(ctx, "ui", { value: ui });
+  Object.defineProperty(ui, "notify", { value: (message: string, severity: "info" | "warning" | "error" = "info") => {
+    last = { message, severity };
+    originalCtx.ui.notify(message, severity);
+  } });
   try {
+    parsed = parseCommandArgs(rawArgs);
+    recordOutcome(ctx, parsed.flags["dry-run"] === true ? "dry-run" : "completed");
     validateCommand(parsed);
     switch (parsed.command) {
       case "add":
@@ -156,7 +189,18 @@ export async function runCommand(rawArgs: string, ctx: ExtensionCommandContext, 
         ctx.ui.notify(helpText(), "info");
     }
   } catch (error) {
-    ctx.ui.notify(`model-doctor: ${errorMessage(error)}`, "error");
+    recordOutcome(ctx, "failed");
+    ctx.ui.notify(`model-doctor: ${boundedText(errorMessage(error), 2000)}`, "error");
+  } finally {
+    if (!ctx.hasUI && sink && last) {
+      const status = last.severity === "error" ? "failed" : commandOutcomes.get(ctx) ?? "completed";
+      const safe = redactSensitiveText(last.message);
+      sink({
+        content: safe.length > 12000 ? `${safe.slice(0, 11950)}\n… result truncated` : safe,
+        details: { command: parsed.command, success: !["failed", "blocked", "activation-failed", "cancelled"].includes(status), status, severity: last.severity, final: true },
+      });
+    }
+    commandOutcomes.delete(ctx);
   }
 }
 
@@ -183,6 +227,7 @@ async function runRollback(args: string[], flags: Record<string, string | boolea
       .map((item) => ({ provider: item.provider, model: item.model, present: false })),
   ];
   const status = await activateRuntime(ctx, doctor, expectations);
+  recordOutcome(ctx, status);
   ctx.ui.notify(`${preview}\nStatus: ${statusMessage(status)}\nRestored. Safety backup: ${restored.safetyBackupPath ? redactSensitiveText(restored.safetyBackupPath) : "none"}`, status === "activation-failed" ? "warning" : "info");
 }
 
@@ -200,6 +245,7 @@ async function runCleanupBackups(args: string[], flags: Record<string, string | 
   ensureHeadlessAuthorization(ctx, flags, "cleanup-backups", false);
   await requireAuthorization(ctx, flags, "cleanup-backups", preview);
   const removed = await doctor.cleanupBackups({ keep, maxAgeMs });
+  recordOutcome(ctx, "persisted");
   ctx.ui.notify(`Removed ${removed.length} backup(s).\nStatus: persisted.`, "warning");
 }
 
@@ -422,17 +468,27 @@ async function selectSingleModelInteractively(
 
 async function runSync(args: string[], flags: Record<string, string | boolean>, ctx: ExtensionCommandContext, doctor: ModelDoctor): Promise<void> {
   const target = args[0];
-  if (!target) throw new DoctorError(`Usage: /model-doctor sync <provider-or-url> [--models <id1,id2>] [--metadata-provider <models.dev-provider>] [--api ${PI_API_FLAG_USAGE}] [--api-key <reference>] [--allow-literal-api-key] [--dry-run] [--yes]`, "invalid-target");
+  if (!target) throw new DoctorError(`Usage: /model-doctor sync <provider-or-url> [--models <id1,id2> | --all] [--metadata-provider <models.dev-provider>] [--api ${PI_API_FLAG_USAGE}] [--api-key <reference>] [--allow-literal-api-key] [--dry-run] [--yes]`, "invalid-target");
   const dryRun = flags["dry-run"] === true;
+  const all = flags.all === true;
   let metadataProvider = typeof flags["metadata-provider"] === "string" ? flags["metadata-provider"] : undefined;
   const explicitModelIds = parseModelIdsFlag(flags.models);
   const selectedApi = typeof flags.api === "string" ? parsePiApiFlag(flags.api) : undefined;
   let modelIds = explicitModelIds;
-  if (!ctx.hasUI && modelIds.length === 0) throw new DoctorError("Model selection is required; use --models <id1,id2> in non-interactive mode", "selection-required");
+  if (!ctx.hasUI && modelIds.length === 0 && !all) throw new DoctorError("Model selection is required; use --models <id1,id2> or --all in non-interactive mode", "selection-required");
   ensureHeadlessAuthorization(ctx, flags, "sync", dryRun);
   const discovery = await doctor.discoverSync({ target, modelIds, metadataProvider, api: selectedApi, apiKey: typeof flags["api-key"] === "string" ? flags["api-key"] : undefined, allowLiteralApiKey: flags["allow-literal-api-key"] === true, dryRun });
-  ctx.ui.notify(redactSensitiveText(`Sync discovery source: ${discovery.source}${discovery.warnings.length ? `\n${discovery.warnings.join("\n")}` : ""}`), "info");
-  if (modelIds.length === 0 && ctx.hasUI) {
+  ctx.ui.notify(`Sync discovery source: ${discovery.source}\n${boundedSection("Discovery warnings", discovery.warnings, (warning) => warning)}`, "info");
+  if (all) {
+    if (discovery.source !== "channel") throw new DoctorError("sync --all requires a successful channel advertisement; fallback models were not selected. Status: not-persisted", "selection-required");
+    modelIds = [...new Set(discovery.candidates.map((candidate) => candidate.id))];
+    if (modelIds.length === 0) {
+      recordOutcome(ctx, "no-op");
+      ctx.ui.notify("Channel advertised 0 models. Status: not-persisted; no write or backup was needed.", "info");
+      return;
+    }
+  }
+  if (!all && modelIds.length === 0 && ctx.hasUI) {
     const candidates = discovery.candidates;
     if (candidates.length === 0) throw new DoctorError(`No ${discovery.source} models found for ${target}; provide --models <id1,id2>`, "invalid-target");
     const selected = await selectModelsInteractively(ctx, `Select models to sync for ${redactSensitiveText(target)}`, candidates);
@@ -466,24 +522,50 @@ async function runSync(args: string[], flags: Record<string, string | boolean>, 
     persistCache: !dryRun && !ctx.hasUI,
   });
   const preview = [
-    `Sync ${redactSensitiveText(proposal.target)}`,
-    `Models: ${proposal.modelIds.map((modelId) => redactSensitiveText(modelId)).join(", ")}`,
-    ...proposal.metadataSources.map((source) => `Metadata source: ${redactSensitiveText(source.modelId)} → ${redactSensitiveText(source.providerId)}/${redactSensitiveText(source.modelId)} (${source.reason})${source.verifiedAt ? `; verified ${source.verifiedAt}` : ""}${source.evidence.length ? `; evidence: ${source.evidence.join(", ")}` : ""}`),
-    proposal.warnings.length > 0 ? `Warnings:\n${proposal.warnings.map((warning) => `⚠ ${redactSensitiveText(warning)}`).join("\n")}` : undefined,
-    formatPlan(proposal.plan),
+    `Sync ${boundedText(proposal.target)}`,
+    boundedSection("Models", proposal.modelIds, (modelId) => modelId),
+    `Conservative defaults: ${proposal.metadataSources.filter((source) => source.reason === "conservative-defaults").length}`,
+    boundedSection("Metadata sources", proposal.metadataSources, (source) => `Metadata source: ${source.requestedModelId ?? source.modelId} → ${source.providerId}/${source.modelId} (${source.reason}${source.matchKind ? `; ${source.matchKind}` : ""})${source.verifiedAt ? `; verified ${source.verifiedAt}` : ""}${source.evidence.length ? `; evidence: ${source.evidence.join(", ")}` : ""}`),
+    boundedSection("Warnings", proposal.warnings, (warning) => `⚠ ${warning}`),
+    formatSyncPlan(proposal.plan),
   ].filter(Boolean).join("\n");
   if (dryRun) {
     ctx.ui.notify(`${preview}\nStatus: not-persisted (dry-run).`, "info");
     return;
   }
   if (proposal.plan.changes.length === 0) {
+    recordOutcome(ctx, "no-op");
     ctx.ui.notify(`${preview}\nNo changes needed.\nStatus: already-persisted (no write or backup was needed).`, "info");
     return;
   }
   await requireAuthorization(ctx, flags, "sync", preview);
   const applied = await doctor.applySync(proposal);
   const status = await activateRuntime(ctx, doctor, proposal.modelIds.map((modelId) => ({ provider: proposal.providerId, model: modelId, present: true })));
-  ctx.ui.notify(`${preview}\nStatus: ${statusMessage(status)}\nSynced. Backup: ${applied.backupPath ? redactSensitiveText(applied.backupPath) : "none (new file)"}`, status === "activation-failed" ? "warning" : "info");
+  recordOutcome(ctx, status);
+  ctx.ui.notify(`${preview}\nStatus: ${statusMessage(status)}\nSynced. Backup: ${applied.backupPath ? boundedText(applied.backupPath) : "none (new file)"}`, status === "activation-failed" ? "warning" : "info");
+}
+
+// Presentation limits only: never truncate the proposal or the persisted model list.
+function boundedText(value: string, limit = 400): string {
+  const safe = redactSensitiveText(value).replace(/[\r\n]+/g, " ");
+  return safe.length > limit ? `${safe.slice(0, limit - 1)}…` : safe;
+}
+
+function boundedSection<T>(label: string, items: readonly T[], format: (item: T) => string, limit = 5): string {
+  return [
+    `${label}: ${items.length}`,
+    ...items.slice(0, limit).map((item) => boundedText(format(item))),
+    ...(items.length > limit ? [`… ${items.length - limit} more ${label.toLowerCase()}`] : []),
+  ].join("\n");
+}
+
+function formatSyncPlan(plan: ChangePlan): string {
+  return [
+    `Target: ${boundedText(plan.target)}`,
+    boundedSection("Changes", plan.changes, (change) => `- ${boundedText(change.path, 100)}: ${formatValue(change.before, change.path)} → ${formatValue(change.after, change.path)} (${boundedText(change.reason, 100)})`, 20),
+    boundedSection("Conflicts", plan.conflicts, (conflict) => `! ${conflict.message}`),
+    boundedSection("Plan warnings", plan.warnings, (warning) => `⚠ ${warning}`),
+  ].join("\n");
 }
 
 /**
@@ -592,6 +674,7 @@ async function runAdd(args: string[], flags: Record<string, string | boolean>, c
     return;
   }
   if (proposal.plan.changes.length === 0) {
+    recordOutcome(ctx, "no-op");
     ctx.ui.notify(`Add succeeded for ${redactSensitiveText(proposal.target)}: configuration is already up to date.\n${preview}\nNo changes needed.\nStatus: already-persisted (no write or backup was needed).`, "info");
     return;
   }
@@ -600,6 +683,7 @@ async function runAdd(args: string[], flags: Record<string, string | boolean>, c
   const status = proposal.modelId
     ? await activateRuntime(ctx, doctor, [{ provider: proposal.providerId, model: proposal.modelId, present: true }])
     : "persisted-reload-required";
+  recordOutcome(ctx, status);
   const outcome = status === "activation-failed"
     ? `Add was persisted for ${redactSensitiveText(proposal.target)}, but runtime activation failed.`
     : `Add succeeded for ${redactSensitiveText(proposal.target)}.`;
@@ -636,6 +720,7 @@ async function runSetApi(args: string[], flags: Record<string, string | boolean>
     return;
   }
   if (proposal.plan.changes.length === 0) {
+    recordOutcome(ctx, "no-op");
     ctx.ui.notify(`Configure succeeded for ${redactSensitiveText(proposal.target)}: transport configuration is already up to date.\n${preview}\nNo changes needed.\nStatus: already-persisted (no write or backup was needed).`, "info");
     return;
   }
@@ -644,6 +729,7 @@ async function runSetApi(args: string[], flags: Record<string, string | boolean>
   const status = proposal.modelIds.length > 0
     ? await activateRuntime(ctx, doctor, proposal.modelIds.map((model) => ({ provider: proposal.providerId, model, present: true })))
     : "persisted-reload-required";
+  recordOutcome(ctx, status);
   const outcome = status === "activation-failed"
     ? `Configure was persisted for ${redactSensitiveText(proposal.target)}, but runtime activation failed.`
     : `Configure succeeded for ${redactSensitiveText(proposal.target)}.`;
@@ -665,10 +751,12 @@ async function runFix(args: string[], flags: Record<string, string | boolean>, c
   }
   const blocking = proposal.result.plan?.conflicts.filter((item) => item.severity === "error") ?? [];
   if (blocking.length > 0) {
+    recordOutcome(ctx, "blocked");
     ctx.ui.notify(`${preview}\nStatus: not-persisted; repair was not applied.`, "warning");
     return;
   }
   if (!proposal.result.plan || proposal.result.plan.changes.length === 0) {
+    recordOutcome(ctx, "no-op");
     ctx.ui.notify(`${preview}\nNo changes needed.\nStatus: already-persisted (no write or backup was needed).`, "info");
     return;
   }
@@ -678,6 +766,7 @@ async function runFix(args: string[], flags: Record<string, string | boolean>, c
     ? [{ provider: target.slice(0, target.indexOf("/")), model: target.slice(target.indexOf("/") + 1), present: true }]
     : (await doctor.list()).map((item) => ({ provider: item.provider, model: item.model, present: true }));
   const status = await activateRuntime(ctx, doctor, targets);
+  recordOutcome(ctx, status);
   ctx.ui.notify(`${preview}\nStatus: ${statusMessage(status)}\nApplied ${applied.plan?.changes.length ?? 0} repair(s). Backup: ${applied.backupPath ? redactSensitiveText(applied.backupPath) : "none"}`, status === "activation-failed" ? "warning" : "info");
 }
 
@@ -698,6 +787,7 @@ async function runRemove(args: string[], flags: Record<string, string | boolean>
   const applied = await doctor.applyRemove(proposal);
   const [provider, model] = splitProviderModelTarget(target);
   const status = await activateRuntime(ctx, doctor, [{ provider, model, present: false }]);
+  recordOutcome(ctx, status);
   ctx.ui.notify(`${preview}\nStatus: ${statusMessage(status)}\nRemoved. Backup: ${applied.backupPath ? redactSensitiveText(applied.backupPath) : "none"}`, status === "activation-failed" ? "warning" : "info");
 }
 
@@ -728,10 +818,12 @@ async function runMigrate(args: string[], flags: Record<string, string | boolean
     return;
   }
   if (proposal.plan.conflicts.some((item) => item.severity === "error")) {
+    recordOutcome(ctx, "blocked");
     ctx.ui.notify(`${preview}\nStatus: not-persisted; migration was not applied.`, "warning");
     return;
   }
   if (proposal.plan.changes.length === 0) {
+    recordOutcome(ctx, "no-op");
     ctx.ui.notify(`${preview}\nNo changes needed.\nStatus: not-persisted.`, "info");
     return;
   }
@@ -743,6 +835,7 @@ async function runMigrate(args: string[], flags: Record<string, string | boolean
     { provider: destinationParts[0], model: destinationParts[1], present: true },
     ...(flags["remove-source"] === true ? [{ provider: sourceParts[0], model: sourceParts[1], present: false }] : []),
   ]);
+  recordOutcome(ctx, status);
   ctx.ui.notify(`${preview}\nStatus: ${statusMessage(status)}\nMigrated. Backup: ${applied.backupPath ? redactSensitiveText(applied.backupPath) : "none"}`, status === "activation-failed" ? "warning" : "info");
 }
 
@@ -843,6 +936,9 @@ function validateCommand(parsed: ParsedCommand): void {
   if (parsed.args.length > maxArgs) {
     throw new DoctorError(`Too many arguments for ${parsed.command}; use /model-doctor help for usage`, "invalid-target");
   }
+  if (parsed.command === "sync" && parsed.flags.all === true && parsed.flags.models !== undefined) {
+    throw new DoctorError("Flags --all and --models cannot be combined", "invalid-target");
+  }
   if (parsed.command === "migrate" && parsed.args[1] && parsed.flags.to !== undefined) {
     throw new DoctorError("Migration destination must be provided either positionally or with --to, not both", "invalid-target");
   }
@@ -885,7 +981,7 @@ function helpText(): string {
     "/model-doctor remove <provider/model> [--dry-run] [--yes]",
     "/model-doctor refresh [--force] [--dry-run]",
     `Sync discovers channel IDs first; fallback sources are unverified. Commands/auth-store references are not executed for discovery.`,
-    `/model-doctor sync <provider-or-url> [--models <id1,id2>] [--metadata-provider <models.dev-provider>] [--api ${PI_API_FLAG_USAGE}] [--api-key <reference>] [--allow-literal-api-key] [--dry-run] [--yes]`,
+    `/model-doctor sync <provider-or-url> [--models <id1,id2> | --all] [--metadata-provider <models.dev-provider>] [--api ${PI_API_FLAG_USAGE}] [--api-key <reference>] [--allow-literal-api-key] [--dry-run] [--yes]`,
     "/model-doctor migrate <provider/model> [--to <provider/model>] [--dry-run] [--yes] [--remove-source]",
     "/model-doctor cleanup-backups [--keep <count>] [--max-age-ms <milliseconds>] [--dry-run] [--yes]",
     "/model-doctor rollback <models.json.bak-timestamp> [--dry-run] [--yes]",
